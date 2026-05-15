@@ -104,6 +104,39 @@ async function main(): Promise<void> {
     log('info', `← codex: ${method} ${params?.threadId ? `thread=${params.threadId.slice(0, 8)}` : ''}${params?.turnId ? ` turn=${params.turnId.slice(0, 8)}` : ''}${params?.item?.type ? ` item.type=${params.item.type}` : ''}`)
   })
 
+  // Server-to-client approval requests. Codex sends these when its
+  // approvalPolicy is `on-request` (default) and it wants to run a
+  // shell command / apply a file change / amend permissions. We MUST
+  // respond by `id` or codex blocks indefinitely.
+  //
+  // Current policy: auto-approve (matches `--dangerously-skip-permissions`
+  // for claude code). The bridge's whole point is unattended remote
+  // operation — if Joey wanted approval prompts he'd be at the terminal
+  // running `codex` directly. A future enhancement could forward each
+  // approval to Telegram with inline yes/no buttons.
+  codex.on('serverRequest', (method: string, params: any, reply: (result: unknown) => void) => {
+    const cmd = params?.command ? ` cmd=\`${String(params.command).slice(0, 80)}\`` : ''
+    const itemId = params?.itemId ? ` item=${String(params.itemId).slice(0, 12)}` : ''
+    log('info', `← codex REQUEST: ${method}${itemId}${cmd} → auto-approve`)
+    switch (method) {
+      case 'item/commandExecution/requestApproval':
+        // CommandExecutionApprovalDecision = "accept" | "acceptForSession" | ...
+        reply({ decision: 'acceptForSession' })
+        break
+      case 'item/fileChange/requestApproval':
+        // FileChangeApprovalDecision = "accept" | "decline" | ...
+        reply({ decision: 'accept' })
+        break
+      case 'permissions/requestApproval':
+        // PermissionsRequestApprovalResponse — accept the proposed amendment
+        reply({ decision: 'accept' })
+        break
+      default:
+        log('warn', `unknown server request ${method}; auto-replying with empty result`)
+        reply({})
+    }
+  })
+
   // --- streaming deltas: edit-in-place pattern ---------------------------
   // While codex streams agentMessage deltas, we edit a single Telegram
   // message rather than spamming new ones. New reply only fires on item
