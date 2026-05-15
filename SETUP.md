@@ -139,7 +139,7 @@ cd ~/codex-tg-bridge
 ```
 
 這會：
-1. 把 `launchd/*.plist.template` 的 `USER` / `NAME` / `PORT` / `STATE_DIR` 占位符替換成你的值
+1. 把 `launchd/*.plist.template` 的 `@@USER@@` / `@@NAME@@` / `@@PORT@@` / `@@STATE_DIR@@` 占位符替換成你的值（sentinel form，避免跟其他 identifier substring 衝突，例如 `BRIDGE_STATE_DIR`）
 2. 寫到 `~/Library/LaunchAgents/com.btai.codex-appserver.$NAME.plist` + `com.btai.codex-tg-bridge.$NAME.plist`
 
 接著 bootstrap（**順序很重要 — appserver 先**）：
@@ -184,6 +184,40 @@ Bridge log 應該看到：
 7. Bridge log 看到 `← turn/completed`
 
 第二則訊息會 **resume 同 thread**（chat_id → thread_id 對應持久化在 `$STATE_DIR/session-map.json`），對話有記憶。
+
+## 6.5 Approval flow (codex 想跑 sudo / 改檔 / 改 permission 時)
+
+Codex 預設 `approvalPolicy = "on-request"` — 想跑某些工具會發 approval request。本 bridge 把它**完整 forward 到 TG**，由你按按鈕決定，**不會 auto-approve**。
+
+流程：
+
+1. Codex 想跑某個 command（例如 `sudo cp ...`）→ 發 `item/commandExecution/requestApproval` JSON-RPC request
+2. Bridge 收到 → 你 TG 收到帶按鈕的訊息：
+   ```
+   🛂 codex wants to run a shell command
+   cwd: `/Users/btai/...`
+   ```
+   sudo cp ~/.codex/config.toml ~/.codex/config.toml.bak
+   ```
+   
+   [ ✅ Accept ] [ 🔁 Accept for session ]
+   [ ❌ Decline ]
+   ```
+3. 你按按鈕 → callback_query → bridge 把 decision 回給 codex
+4. Codex 收到 decision 繼續或跳過
+
+支援的 approval type：
+- `commandExecution`（3 顆按鈕：Accept / Accept-for-session / Decline）
+- `fileChange`（2 顆按鈕：Accept / Decline）
+- `permissions`（2 顆按鈕：Accept / Decline）
+
+**Safety fallbacks**：
+- Unknown method → auto **decline**
+- 找不到對應的 TG chat → auto **decline**
+- 發送 TG prompt 失敗 → auto **decline**
+- access.json 不在 approved 名單的 user 點按鈕 → 拒絕回應
+
+要改 approval policy（例如 trusted command 改成不問），改 `~/.codex/config.toml`，不要改 bridge code。
 
 ## 7. 多 bot 操作（multiple instances）
 
