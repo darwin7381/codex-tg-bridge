@@ -96,6 +96,46 @@ type RpcError = {
 }
 type RpcNotification = { jsonrpc: '2.0'; method: string; params?: unknown }
 
+// --- subscription-safety guard -------------------------------------------
+
+import { readFileSync, existsSync } from 'node:fs'
+
+/**
+ * Verifies that codex CLI is logged in via ChatGPT account (subscription
+ * billing) rather than an API key (pay-per-token). Refuses to start if
+ * `~/.codex/auth.json` has `auth_mode: "apikey"`.
+ *
+ * Background: setting `codex login --with-api-key` flips codex into
+ * per-token billing. The bridge's whole point is to use the existing
+ * ChatGPT subscription — running on API tokens silently costs real
+ * dollars per turn. Fail closed.
+ *
+ * To fix when this fires: `codex logout && codex login` (browser flow
+ * to OAuth-in via the ChatGPT account).
+ */
+export function assertSubscriptionAuth(authPath?: string): void {
+  const p = authPath ?? `${process.env.HOME ?? ''}/.codex/auth.json`
+  if (!existsSync(p)) {
+    throw new Error(
+      `Refusing to start: codex auth.json not found at ${p}. ` +
+        `Run \`codex login\` first (browser-based ChatGPT sign-in).`,
+    )
+  }
+  let auth: any
+  try {
+    auth = JSON.parse(readFileSync(p, 'utf8'))
+  } catch (err) {
+    throw new Error(`Refusing to start: cannot parse ${p}: ${(err as Error).message}`)
+  }
+  if (auth.auth_mode === 'apikey') {
+    throw new Error(
+      `Refusing to start: codex is logged in via API key (pay-per-token billing). ` +
+        `Run \`codex logout && codex login\` (browser flow) to switch to ChatGPT subscription. ` +
+        `Verify with \`codex login status\` — should show "Logged in via ChatGPT account".`,
+    )
+  }
+}
+
 // codex app-server omits the `jsonrpc: "2.0"` field on responses and
 // notifications, so we identify frames by shape rather than the version
 // tag.

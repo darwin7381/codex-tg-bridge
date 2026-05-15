@@ -1,10 +1,17 @@
 # codex-tg-bridge
 
-> **Zero-degradation** Telegram ↔ OpenAI Codex bridge. Forwards raw user text
-> to `codex app-server` over JSON-RPC/WebSocket and streams `item/*`
-> notifications back to Telegram unchanged. No prompt injection, no model
-> overrides, no role reframing — Codex behaves byte-for-byte the same as
-> when you type into the local CLI.
+> **Zero-degradation** Telegram bridges for **OpenAI Codex** *and*
+> **Google Gemini**. Forwards raw user text to the agent over its native
+> protocol (Codex app-server WebSocket JSON-RPC for Codex; ACP stdio
+> JSON-RPC for Gemini) and streams agent output back to Telegram
+> unchanged. No prompt injection, no model overrides, no role reframing —
+> each agent behaves byte-for-byte the same as when you type into its
+> local CLI.
+
+> Repo name says `codex-tg-bridge` but `src/gemini-server.ts` lives here
+> too. Both bridges share the platform modules
+> (`telegram-client.ts`, `session-map.ts`, `turn-stream-consumer.ts`)
+> and differ only in the agent-protocol client.
 
 ---
 
@@ -134,16 +141,32 @@ verbatim, the zero-degradation invariants are intact.
 
 ## File map
 
+Shared platform modules (work for both bridges):
+
 | File | Purpose |
 |---|---|
-| `src/codex-client.ts` | WebSocket JSON-RPC client; handles responses, notifications, **and** server-to-client requests (e.g. approval prompts). Audit rules #1/#2/#4. |
 | `src/telegram-client.ts` | grammy bot with access.json allowlist + ackReaction + inline-keyboard helper + `callback_query` handler for approval clicks. |
-| `src/turn-stream-consumer.ts` | Per-agentMessage streaming consumer ported from Hermes `gateway/stream_consumer.py`: queue + single-task drain, 1 s edit interval, adaptive backoff to 10 s on Telegram 429, fallback to one-shot send after 3 strikes. |
-| `src/approval-tracker.ts` | Maps short `cbId` → pending JSON-RPC reply callbacks. User's button click resolves the approval. |
-| `src/item-formatter.ts` | Render every `ThreadItem` type to a TG-friendly string. |
-| `src/session-map.ts` | Persistent chat_id → thread_id mapping. |
-| `src/server.ts` | Bridge daemon orchestrating all of the above. |
-| `scripts/smoke-test.ts` | Bypasses TG; verifies codex side end-to-end. |
+| `src/turn-stream-consumer.ts` | Streaming consumer ported from Hermes `gateway/stream_consumer.py`: queue + single-task drain, 1 s edit interval, adaptive backoff to 10 s on Telegram 429, fallback to one-shot send after 3 strikes. |
+| `src/approval-tracker.ts` | Maps short `cbId` → pending JSON-RPC reply callbacks (codex's fixed-enum decision flow). |
+| `src/session-map.ts` | Persistent chat_id → session/thread id mapping. |
+
+Codex side:
+
+| File | Purpose |
+|---|---|
+| `src/codex-client.ts` | WebSocket JSON-RPC client for `codex app-server`. Handles responses, notifications, **and** server-to-client requests (approval prompts). Audit rules #1/#2/#4. Boot-time guard refuses to start if `auth_mode=apikey` (subscription-only). |
+| `src/item-formatter.ts` | Render every codex `ThreadItem` type to TG-friendly text. |
+| `src/server.ts` | Codex bridge daemon (entry: `bun start`). |
+| `scripts/smoke-test.ts` | TG-bypass smoke test against `codex app-server`. |
+
+Gemini side:
+
+| File | Purpose |
+|---|---|
+| `src/gemini-client.ts` | Stdio NDJSON JSON-RPC client for `gemini --acp`. Spawns gemini as a subprocess and speaks ACP (Agent Client Protocol). Boot-time guard refuses to start if `*_API_KEY` envs are set (subscription-only). |
+| `src/acp-item-formatter.ts` | Render ACP `session/update` payloads (plan / tool_call / tool_call_update / etc.) to TG-friendly text. |
+| `src/gemini-server.ts` | Gemini bridge daemon (entry: `bun start-gemini`). Dynamic inline-keyboard approvals — buttons reflect agent-supplied option list per request. |
+| `scripts/smoke-test-gemini.ts` | TG-bypass smoke test against `gemini --acp`. |
 | `launchd/*.plist.template` | LaunchAgent templates (run via `install.sh`). |
 | `launchd/install.sh` | Substitute `USER` / `NAME` / `PORT` / `STATE_DIR` and write plists. |
 

@@ -26,7 +26,7 @@
  *                         to its own cwd if omitted.
  */
 
-import { CodexClient } from './codex-client.ts'
+import { CodexClient, assertSubscriptionAuth } from './codex-client.ts'
 import { TelegramClient, type InboundMessage } from './telegram-client.ts'
 import { SessionMap } from './session-map.ts'
 import { formatItem } from './item-formatter.ts'
@@ -55,6 +55,16 @@ const DEFAULT_CWD = process.env.BRIDGE_DEFAULT_CWD ?? undefined
 
 if (!TG_TOKEN) {
   console.error('[bridge] missing TELEGRAM_BOT_TOKEN (set in env or $STATE_DIR/.env)')
+  process.exit(1)
+}
+
+// Fail-fast on subscription-safety check. We exist to use the existing
+// ChatGPT subscription quota — running on API tokens would silently
+// burn pay-per-token billing every turn.
+try {
+  assertSubscriptionAuth()
+} catch (err) {
+  console.error('[bridge]', (err as Error).message)
   process.exit(1)
 }
 
