@@ -213,6 +213,32 @@ async function main(): Promise<void> {
     }
   })
 
+  // Map cancel-ref → sessionId for the ⛔ Stop button below.
+  const cancelRefToSession = new Map<string, string>()
+  const stopMessageBySession = new Map<string, { chatId: string; messageId: number }>()
+
+  // User clicked ⛔ Stop button.
+  tg.on('cancel', async (ev: { ref: string; chatId: string; messageId?: number }) => {
+    const sessionId = cancelRefToSession.get(ev.ref)
+    if (!sessionId) {
+      log('warn', `cancel ref=${ev.ref} not found (turn already complete?)`)
+      return
+    }
+    cancelRefToSession.delete(ev.ref)
+    log('info', `cancel ref=${ev.ref} → session/cancel session=${sessionId.slice(0, 8)}`)
+    try {
+      await gemini.sessionCancel(sessionId)
+    } catch (err) {
+      log('warn', `session/cancel failed: ${(err as Error).message}`)
+    }
+    if (ev.messageId) {
+      void tg
+        .editMessage(ev.chatId, ev.messageId, '⛔ cancel requested — gemini stopping.')
+        .catch(() => {})
+      void tg.clearButtons(ev.chatId, ev.messageId).catch(() => {})
+    }
+  })
+
   // --- inbound TG → gemini -----------------------------------------------
   tg.on('message', async (m: InboundMessage) => {
     log('info', `→ TG msg from chat=${m.chatId} user=${m.username}: ${m.text.slice(0, 80)}`)
@@ -236,6 +262,18 @@ async function main(): Promise<void> {
       sessionToChat.set(sessionId, m.chatId)
     }
 
+    // Post ⛔ Stop button so the user can interrupt long-running turns.
+    const cancelRef = randomBytes(3).toString('hex')
+    cancelRefToSession.set(cancelRef, sessionId)
+    try {
+      const stopMsgId = await tg.sendWithButtons(m.chatId, '⏳ gemini is working…', [
+        [{ text: '⛔ Stop', data: `cancel:${cancelRef}` }],
+      ])
+      stopMessageBySession.set(sessionId, { chatId: m.chatId, messageId: stopMsgId })
+    } catch (err) {
+      log('warn', `failed to post stop button: ${(err as Error).message}`)
+    }
+
     // Audit rule #3: raw text + raw ACP content blocks for any attached
     // images / audio / documents. attachmentsToAcpContent does no
     // wrapping — it maps the Attachment[] one-to-one to ContentBlock[]
@@ -251,6 +289,16 @@ async function main(): Promise<void> {
       const response = (await promise) as { stopReason?: string }
       activeTurnPromises.delete(sessionId)
       log('info', `session/prompt complete chat=${m.chatId} stopReason=${response?.stopReason ?? '?'}`)
+      // Remove the cancel ref + tidy the Stop message.
+      cancelRefToSession.delete(cancelRef)
+      const stop = stopMessageBySession.get(sessionId)
+      if (stop) {
+        stopMessageBySession.delete(sessionId)
+        void tg
+          .editMessage(stop.chatId, stop.messageId, `✓ gemini complete (${response?.stopReason ?? 'end_turn'})`)
+          .catch(() => {})
+        void tg.clearButtons(stop.chatId, stop.messageId).catch(() => {})
+      }
       // Finalize streaming consumer for this turn.
       const consumer = turnConsumers.get(sessionId)
       if (consumer) {
@@ -260,6 +308,15 @@ async function main(): Promise<void> {
     } catch (err) {
       log('error', `session/prompt failed: ${(err as Error).message}`)
       activeTurnPromises.delete(sessionId)
+      cancelRefToSession.delete(cancelRef)
+      const stop = stopMessageBySession.get(sessionId)
+      if (stop) {
+        stopMessageBySession.delete(sessionId)
+        void tg
+          .editMessage(stop.chatId, stop.messageId, `❌ gemini turn failed`)
+          .catch(() => {})
+        void tg.clearButtons(stop.chatId, stop.messageId).catch(() => {})
+      }
       const consumer = turnConsumers.get(sessionId)
       if (consumer) {
         consumer.finish()

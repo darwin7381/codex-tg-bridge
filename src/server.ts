@@ -35,6 +35,7 @@ import { ApprovalTracker, type ApprovalType } from './approval-tracker.ts'
 import { attachmentsToCodexInput } from './attachment-to-input.ts'
 import { config as loadDotenv } from 'dotenv'
 import { existsSync } from 'node:fs'
+import { randomBytes } from 'node:crypto'
 
 // --- env loading ----------------------------------------------------------
 
@@ -282,27 +283,123 @@ async function main(): Promise<void> {
     // formatter and send as a separate fresh TG message. These are
     // discrete events without streaming deltas.
     const text = formatItem(item)
-    if (!text) return
-    try {
-      await tg.reply(chatId, text)
-    } catch (err) {
-      log('warn', `reply failed for item ${item.type}: ${(err as Error).message}`)
+    if (text) {
+      try {
+        await tg.reply(chatId, text)
+      } catch (err) {
+        log('warn', `reply failed for item ${item.type}: ${(err as Error).message}`)
+      }
     }
+
+    // Outbound media: when codex generates an image or writes an
+    // image / PDF / archive on disk, surface the actual file so the user
+    // sees it in Telegram instead of just a path string.
+    void sendOutboundMedia(item, chatId).catch(err =>
+      log('warn', `outbound media send failed for ${item.type}: ${err.message}`),
+    )
   })
+
+  /**
+   * Detect agent-generated files worth sending as TG media.
+   *
+   * Codex item types we know how to surface:
+   *   imageGeneration — has `savedPath` (absolute) when persisted
+   *   fileChange      — `changes[].path`; image MIME → photo, else doc
+   */
+  async function sendOutboundMedia(item: any, chatId: string): Promise<void> {
+    if (item.type === 'imageGeneration' && typeof item.savedPath === 'string') {
+      try {
+        await tg.sendPhoto(chatId, item.savedPath, item.revisedPrompt ?? undefined)
+      } catch (err) {
+        log('warn', `sendPhoto failed: ${(err as Error).message}`)
+      }
+      return
+    }
+    if (item.type === 'fileChange' && Array.isArray(item.changes)) {
+      for (const c of item.changes) {
+        const p: string | undefined = c?.path
+        if (!p) continue
+        const ext = p.toLowerCase().split('.').pop() ?? ''
+        if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic'].includes(ext)) {
+          try {
+            await tg.sendPhoto(chatId, p, `📸 ${p}`)
+          } catch (err) {
+            log('warn', `sendPhoto(${p}) failed: ${(err as Error).message}`)
+          }
+        } else if (['pdf', 'zip', 'tar', 'gz', 'mp4', 'mov', 'wav', 'mp3'].includes(ext)) {
+          try {
+            await tg.sendDocument(chatId, p, `📎 ${p}`)
+          } catch (err) {
+            log('warn', `sendDocument(${p}) failed: ${(err as Error).message}`)
+          }
+        }
+      }
+    }
+  }
 
   // We don't surface item/started events to TG (would be noisy — most show
   // up as item/completed later anyway). Logged via the generic listener
   // above for debugging.
 
-  codex.on('method:turn/started', (p: any) => {
+  // Map turnId → TG message id of the "⛔ Stop" prompt so we can
+  // remove the button when the turn completes (and ID the active turn
+  // when the user clicks Stop).
+  const stopMessageByTurn = new Map<string, { chatId: string; messageId: number; threadId: string }>()
+  const turnIdByCancelRef = new Map<string, { threadId: string; turnId: string }>()
+
+  codex.on('method:turn/started', async (p: any) => {
     const { threadId, turn } = p as { threadId: string; turn: { turnId: string } }
     const chatId = threadToChat.get(threadId)
-    if (chatId) turnToChat.set(turn.turnId, chatId)
+    if (!chatId) return
+    turnToChat.set(turn.turnId, chatId)
+
+    // Post a "⛔ Stop" inline button anchored to this turn. Click →
+    // codex.turnInterrupt(threadId, turnId).
+    const ref = randomBytes(3).toString('hex')
+    turnIdByCancelRef.set(ref, { threadId, turnId: turn.turnId })
+    try {
+      const msgId = await tg.sendWithButtons(chatId, '⏳ codex is working…', [
+        [{ text: '⛔ Stop', data: `cancel:${ref}` }],
+      ])
+      stopMessageByTurn.set(turn.turnId, { chatId, messageId: msgId, threadId })
+    } catch (err) {
+      log('warn', `failed to post stop button: ${(err as Error).message}`)
+    }
   })
 
   codex.on('method:turn/completed', async (p: any) => {
     const { turn } = p as { threadId: string; turn: { turnId: string } }
     turnToChat.delete(turn.turnId)
+    // Remove stop button (edit message in place).
+    const stop = stopMessageByTurn.get(turn.turnId)
+    if (stop) {
+      stopMessageByTurn.delete(turn.turnId)
+      void tg.editMessage(stop.chatId, stop.messageId, '✓ codex turn complete').catch(() => {})
+      void tg.clearButtons(stop.chatId, stop.messageId).catch(() => {})
+    }
+    for (const [ref, info] of turnIdByCancelRef.entries()) {
+      if (info.turnId === turn.turnId) turnIdByCancelRef.delete(ref)
+    }
+  })
+
+  // User clicked ⛔ Stop button.
+  tg.on('cancel', async (ev: { ref: string; chatId: string; messageId?: number }) => {
+    const info = turnIdByCancelRef.get(ev.ref)
+    if (!info) {
+      log('warn', `cancel ref=${ev.ref} not found (turn already complete?)`)
+      return
+    }
+    turnIdByCancelRef.delete(ev.ref)
+    log('info', `cancel ref=${ev.ref} → turn/interrupt thread=${info.threadId.slice(0,8)} turn=${info.turnId.slice(0,8)}`)
+    try {
+      await codex.turnInterrupt(info.threadId, info.turnId)
+    } catch (err) {
+      log('warn', `turn/interrupt failed: ${(err as Error).message}`)
+    }
+    if (ev.messageId) {
+      void tg.editMessage(ev.chatId, ev.messageId, '⛔ cancel requested — codex stopping.').catch(() => {})
+      void tg.clearButtons(ev.chatId, ev.messageId).catch(() => {})
+    }
   })
 
   // --- inbound TG → codex ------------------------------------------------
