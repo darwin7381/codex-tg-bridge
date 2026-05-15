@@ -341,6 +341,35 @@ async function main(): Promise<void> {
   // up as item/completed later anyway). Logged via the generic listener
   // above for debugging.
 
+  /**
+   * Ask codex to rehydrate a thread by id (loads its rollout file). On
+   * success returns the thread id; on failure clears the session-map
+   * entry, opens a fresh thread, updates the map, and returns null so
+   * the caller knows to re-read sessionMap.
+   */
+  async function tryResumeThread(threadId: string, chatId: string): Promise<string | null> {
+    try {
+      await codex.threadResume(threadId)
+      log('info', `thread/resume chat=${chatId} threadId=${threadId.slice(0, 8)} (loaded from disk)`)
+      return threadId
+    } catch (err) {
+      const msg = (err as Error).message
+      log('warn', `thread/resume failed for ${threadId.slice(0, 8)} (${msg}); falling back to thread/start`)
+      await sessionMap.clear(chatId)
+      try {
+        const resp = await codex.threadStart(DEFAULT_CWD)
+        const fresh = resp.thread.id
+        await sessionMap.set(chatId, fresh)
+        threadToChat.delete(threadId)
+        threadToChat.set(fresh, chatId)
+        log('info', `thread/start (auto-recovery) chat=${chatId} threadId=${fresh.slice(0, 8)}`)
+      } catch (err2) {
+        log('error', `auto-recovery thread/start failed: ${(err2 as Error).message}`)
+      }
+      return null
+    }
+  }
+
   // Map turnId → TG message id of the "⛔ Stop" prompt so we can
   // remove the button when the turn completes (and ID the active turn
   // when the user clicks Stop).
@@ -423,7 +452,19 @@ async function main(): Promise<void> {
         return
       }
     } else {
+      // We have a stored thread id — ensure the app-server has it
+      // loaded into memory. Codex persists threads on disk
+      // (~/.codex/sessions/*.jsonl), so the server can rehydrate a
+      // session that wasn't created in this app-server lifetime.
+      // If thread/resume fails (e.g. the rollout file is gone) fall
+      // back to thread/start so the user always gets a working session.
       threadToChat.set(threadId, m.chatId)
+      const resumed = await tryResumeThread(threadId, m.chatId)
+      if (resumed === null) {
+        // Original threadId is unrecoverable; threadId variable was
+        // already replaced inside tryResumeThread via callback below.
+        threadId = sessionMap.get(m.chatId)!
+      }
     }
 
     // Audit rule #3: raw text + raw localImage paths. attachmentsToCodexInput
