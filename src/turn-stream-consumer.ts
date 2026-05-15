@@ -117,8 +117,17 @@ export class TurnStreamConsumer {
       }
 
       if (this.done) {
-        // If fallback engaged and we never sent anything, deliver the
-        // final text now (one fresh reply, no edits).
+        // Final flush ALWAYS runs (regardless of new-content check) so
+        // the cursor gets stripped on the last edit even when finish()
+        // arrives with no buffer growth since the previous flush. This
+        // is the bug from 2026-05-15 — message ended visibly with the
+        // cursor still attached.
+        if (!this.fallbackMode && this.messageId > 0) {
+          await this.flush() // displayText uses this.done=true → no cursor
+        }
+        // Fallback path: if no message was ever sent (e.g. 3 flood
+        // strikes from the very first attempt), deliver the buffered
+        // final text now as one fresh reply.
         if (this.fallbackMode && this.messageId === -1 && this.buffer) {
           try {
             await this.tg.reply(this.chatId, this.buffer.slice(0, MAX_TG_TEXT))

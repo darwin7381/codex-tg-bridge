@@ -104,6 +104,7 @@ function isResponse(m: any): m is RpcSuccess | RpcError {
     m &&
     typeof m === 'object' &&
     typeof m.id === 'number' &&
+    typeof m.method !== 'string' &&
     ('result' in m || 'error' in m)
   )
 }
@@ -114,6 +115,24 @@ function isNotification(m: any): m is RpcNotification {
     typeof m === 'object' &&
     typeof m.method === 'string' &&
     m.id === undefined
+  )
+}
+
+// Server-to-client JSON-RPC request: has both `id` AND `method`. Codex
+// uses these for approval prompts (commandExecution / fileChange /
+// permissions) when `approvalPolicy != "never"`.
+type ServerRequest = {
+  jsonrpc?: '2.0'
+  id: number
+  method: string
+  params?: unknown
+}
+function isServerRequest(m: any): m is ServerRequest {
+  return (
+    m &&
+    typeof m === 'object' &&
+    typeof m.id === 'number' &&
+    typeof m.method === 'string'
   )
 }
 
@@ -169,6 +188,12 @@ export class CodexClient extends EventEmitter {
   /**
    * One JSON-RPC message per WebSocket text frame.
    * Reference: https://developers.openai.com/codex/app-server
+   *
+   * Three frame types are possible:
+   *   - Response (id + result/error): reply to our own request
+   *   - Notification (method, no id): server-pushed event
+   *   - Server request (id + method): server wants us to decide
+   *     something (e.g. approve a command). Must respond by `id`.
    */
   private onFrame(text: string): void {
     let msg: unknown
@@ -197,6 +222,19 @@ export class CodexClient extends EventEmitter {
       }
       return
     }
+    if (isServerRequest(msg)) {
+      // Audit rule #4 (corollary): never silently drop server-to-client
+      // requests. Re-emit for the server.ts orchestrator to handle, and
+      // include a one-shot reply function so it can craft the right
+      // response shape per method without us re-encoding here.
+      this.emit('serverRequest', msg.method, msg.params, (result: unknown) =>
+        this.sendResponse(msg.id, result),
+      )
+      this.emit(`request:${msg.method}`, msg.params, (result: unknown) =>
+        this.sendResponse(msg.id, result),
+      )
+      return
+    }
     if (isNotification(msg)) {
       // Audit rule #4: forward verbatim to listeners. No filtering.
       this.emit('notification', msg.method, msg.params)
@@ -204,6 +242,12 @@ export class CodexClient extends EventEmitter {
       return
     }
     this.emit('error', new Error(`unrecognized RPC frame: ${text.slice(0, 200)}`))
+  }
+
+  private sendResponse(id: number, result: unknown): void {
+    if (!this.ws || !this.connected) return
+    const frame = { jsonrpc: '2.0', id, result }
+    this.ws.send(JSON.stringify(frame))
   }
 
   private send<T>(method: string, params?: unknown): Promise<T> {
