@@ -25,6 +25,7 @@ import { TelegramClient, type InboundMessage } from './telegram-client.ts'
 import { SessionMap } from './session-map.ts'
 import { TurnStreamConsumer } from './turn-stream-consumer.ts'
 import { formatAcpUpdate } from './acp-item-formatter.ts'
+import { attachmentsToAcpContent } from './attachment-to-input.ts'
 import { config as loadDotenv } from 'dotenv'
 import { existsSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
@@ -235,11 +236,18 @@ async function main(): Promise<void> {
       sessionToChat.set(sessionId, m.chatId)
     }
 
-    // Audit rule #3: raw text.
+    // Audit rule #3: raw text + raw ACP content blocks for any attached
+    // images / audio / documents. attachmentsToAcpContent does no
+    // wrapping — it maps the Attachment[] one-to-one to ContentBlock[]
+    // (base64-encoding images / audio for the wire).
     try {
-      const promise = gemini.sessionPrompt(sessionId, m.text)
+      const prompt = await attachmentsToAcpContent(m.text, m.attachments)
+      const promise = gemini.sessionPrompt(sessionId, prompt)
       activeTurnPromises.set(sessionId, promise)
-      log('info', `session/prompt chat=${m.chatId} session=${sessionId.slice(0, 8)} input.len=${m.text.length}`)
+      const att = m.attachments.length
+        ? ` attachments=[${m.attachments.map(a => a.kind).join(',')}]`
+        : ''
+      log('info', `session/prompt chat=${m.chatId} session=${sessionId.slice(0, 8)} prompt.blocks=${prompt.length}${att}`)
       const response = (await promise) as { stopReason?: string }
       activeTurnPromises.delete(sessionId)
       log('info', `session/prompt complete chat=${m.chatId} stopReason=${response?.stopReason ?? '?'}`)

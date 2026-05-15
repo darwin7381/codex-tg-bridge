@@ -337,15 +337,20 @@ export class CodexClient extends EventEmitter {
   }
 
   /**
-   * Audit rule #2 + #3: send only `threadId` and the raw user text wrapped
-   * in a single `UserInput` of type "text". No model / personality / effort
-   * overrides. No prompt prefix / suffix.
+   * Audit rule #2 + #3: send only `threadId` and the user input blocks.
+   * No model / personality / effort overrides, no prompt prefix / suffix.
+   * Use the single-string overload for plain text; pass an array for
+   * mixed multimedia (text + localImage / image).
    */
-  turnStart(threadId: string, text: string): Promise<unknown> {
-    return this.send('turn/start', {
-      threadId,
-      input: [{ type: 'text', text, text_elements: [] }],
-    })
+  turnStart(
+    threadId: string,
+    input: string | ReadonlyArray<unknown>,
+  ): Promise<unknown> {
+    const inputArr =
+      typeof input === 'string'
+        ? [{ type: 'text', text: input, text_elements: [] }]
+        : input
+    return this.send('turn/start', { threadId, input: inputArr })
   }
 
   turnInterrupt(threadId: string, turnId: string): Promise<unknown> {
