@@ -2,6 +2,60 @@
 
 All notable changes to this project. Versions follow [SemVer](https://semver.org/).
 
+## [Unreleased] — 2026-05-15 / 2026-05-16
+
+### Added — multimedia + UX (both bridges)
+
+Inbound multimedia is now first-class. TelegramClient subscribes to
+photo / voice / audio / document / video / animation / sticker
+messages, downloads attachments via the new AttachmentStore to
+`$STATE_DIR/inbox/`, and surfaces them as `attachments: Attachment[]`
+on `InboundMessage` along with the message caption and any
+`reply_to_message_id`. Hourly background GC prunes files older than
+7 days or total size > 1 GiB.
+
+The new `attachment-to-input.ts` maps `Attachment[]` to each agent's
+native input shape:
+- **Codex** — `image` → `localImage{path}`; audio / video render as
+  text mentions guiding the agent to `Bash whisper` or `ffmpeg`
+  themselves; text-MIME documents inline (up to 32 KiB); other
+  documents mention path so the agent can `Read` them.
+- **Gemini** — `image` → ACP `image{base64+mime}`; audio →
+  `audio{base64+mime}` (gemini-cli's `promptCapabilities.audio`);
+  text docs inline; other docs as `resource_link`.
+
+Outbound media (codex). After every `item/completed` for
+`imageGeneration` or `fileChange`, the bridge inspects the result
+paths and — if the file is an image / PDF / archive / video / audio —
+sends it as a TG photo (`sendPhoto`) or document (`sendDocument`)
+alongside the formatter's text rendering. Detected by extension.
+
+⛔ Cancel button (both bridges). On every turn start the bridge
+posts a "⏳ … is working… [⛔ Stop]" message anchored to the turn.
+Clicking the button routes `cancel:<ref>` back through grammy's
+`callback_query` handler. The server resolves the ref to the active
+codex turn (`turn/interrupt`) or active gemini session
+(`session/cancel`) and edits the Stop message in place to confirm.
+After the turn completes (or fails) the Stop message is edited to
+show the outcome and the inline keyboard is removed.
+
+Long-message split. `TelegramClient.reply()` now splits any reply
+longer than ~3.8 KB on paragraph / line boundaries and appends
+"[i/n]" continuation markers. The returned `message_id` is the FIRST
+chunk so callers can still edit / react against the head.
+
+`CodexClient.turnStart` / `GeminiClient.sessionPrompt` now accept
+either a plain string (single-block convenience) or a pre-built
+input/content block array for mixed multimedia.
+
+### Background
+
+`@scout_Codex_bot` couldn't see anything but text — Joey caught this
+("能不能傳圖傳影片傳多媒體等 telegram 所有應該能傳的東西？還是只是他刷智障？"). It was the
+bridge that was blind, not the agents. Both agent CLIs can handle
+images; gemini can handle audio natively. This change wires the TG
+surface to the agent input surface so attachments flow through.
+
 ## [Unreleased] — 2026-05-15 (later in day)
 
 ### Added — `gemini-tg-bridge`
