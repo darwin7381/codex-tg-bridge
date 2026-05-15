@@ -145,7 +145,9 @@ Shared platform modules (work for both bridges):
 
 | File | Purpose |
 |---|---|
-| `src/telegram-client.ts` | grammy bot with access.json allowlist + ackReaction + inline-keyboard helper + `callback_query` handler for approval clicks. |
+| `src/telegram-client.ts` | grammy bot with access.json allowlist + ackReaction + inline-keyboard helper. Subscribes to every grammy message type (text / photo / voice / audio / document / video / animation / sticker). Routes `callback_query` for approval clicks and ⛔ cancel clicks. Outbound helpers: reply (with long-message split), editMessage, react, sendWithButtons, sendPhoto, sendDocument, clearButtons. |
+| `src/attachment-store.ts` | Downloads TG `file_id` files to `$STATE_DIR/inbox/`, hourly GC (7-day age cap, 1 GiB total). |
+| `src/attachment-to-input.ts` | Maps `Attachment[]` to codex `UserInput[]` or ACP `ContentBlock[]` (image/audio base64, text-MIME inline, fall-through mentions). |
 | `src/turn-stream-consumer.ts` | Streaming consumer ported from Hermes `gateway/stream_consumer.py`: queue + single-task drain, 1 s edit interval, adaptive backoff to 10 s on Telegram 429, fallback to one-shot send after 3 strikes. |
 | `src/approval-tracker.ts` | Maps short `cbId` → pending JSON-RPC reply callbacks (codex's fixed-enum decision flow). |
 | `src/session-map.ts` | Persistent chat_id → session/thread id mapping. |
@@ -170,22 +172,38 @@ Gemini side:
 | `launchd/*.plist.template` | LaunchAgent templates (run via `install.sh`). |
 | `launchd/install.sh` | Substitute `USER` / `NAME` / `PORT` / `STATE_DIR` and write plists. |
 
-## Capabilities (as of 0.1.0 — see [CHANGELOG.md](./CHANGELOG.md))
+## Capabilities (see [CHANGELOG.md](./CHANGELOG.md) for full history)
 
-- ✅ Telegram ↔ codex app-server JSON-RPC bridge with five audit
-  invariants enforced in code.
-- ✅ Real-time streaming of `agentMessage` deltas (Hermes-pattern
-  consumer, 1 s edit interval, adaptive backoff).
-- ✅ Other `item/*` types (commandExecution, fileChange, reasoning,
-  mcpToolCall, plan, etc.) render via formatter and post as separate
-  TG messages.
-- ✅ Persistent chat ↔ thread mapping (`state/session-map.json`),
-  resumes after restart.
+- ✅ Two bridges in one repo — Telegram ↔ codex app-server and
+  Telegram ↔ gemini ACP. Both honour the five audit invariants in
+  code at the protocol boundary.
+- ✅ Real-time streaming (Hermes-pattern consumer: 1 s edit interval,
+  adaptive backoff to 10 s on Telegram 429, fallback to one-shot after
+  3 strikes).
+- ✅ **Inbound multimedia**: photo / voice / audio / document / video
+  / animation / sticker — downloaded to `$STATE_DIR/inbox/` and
+  mapped into each agent's native input shape. Image works on both
+  sides; audio works natively on gemini; codex side renders audio as
+  a `Bash whisper …` hint for the agent to transcribe itself.
+- ✅ **Outbound multimedia (codex)**: `imageGeneration` and image /
+  PDF / archive / audio / video `fileChange` outputs are auto-sent
+  back to TG as photos or documents alongside the agent's text
+  reply.
 - ✅ Inline-keyboard **approval flow**: codex `requestApproval`
-  prompts (command exec / file change / permissions) surface in
-  Telegram with Accept / Accept-for-session / Decline buttons.
-- ✅ Smoke test that proves codex side honours `~/.codex/config.toml`
-  and AGENTS.md and round-trips the user prompt verbatim.
+  prompts (command / fileChange / permissions) and gemini
+  `session/request_permission` (dynamic agent-supplied options)
+  both surface as Telegram inline buttons. Default fail-closed if the
+  prompt can't be delivered.
+- ✅ ⛔ **Cancel button** on every turn — click to interrupt codex
+  (`turn/interrupt`) or gemini (`session/cancel`).
+- ✅ Long-message split with `[i/n]` continuation markers.
+- ✅ Persistent chat ↔ session/thread mapping survives restart.
+- ✅ Hourly GC of the attachment inbox (7-day age cap, 1 GiB total).
+- ✅ Subscription-billing guards on both sides — codex
+  (`auth_mode != apikey`) and gemini (no `*_API_KEY` env). Fail-fast
+  at boot.
+- ✅ Smoke tests that prove each agent side honours its own config
+  and round-trips the prompt verbatim.
 
 ## Limitations / known gaps
 
