@@ -280,13 +280,52 @@ async function main(): Promise<void> {
     // (base64-encoding images / audio for the wire).
     try {
       const prompt = await attachmentsToAcpContent(m.text, m.attachments)
-      const promise = gemini.sessionPrompt(sessionId, prompt)
-      activeTurnPromises.set(sessionId, promise)
       const att = m.attachments.length
         ? ` attachments=[${m.attachments.map(a => a.kind).join(',')}]`
         : ''
-      log('info', `session/prompt chat=${m.chatId} session=${sessionId.slice(0, 8)} prompt.blocks=${prompt.length}${att}`)
-      const response = (await promise) as { stopReason?: string }
+
+      let response: { stopReason?: string }
+      try {
+        const promise = gemini.sessionPrompt(sessionId, prompt)
+        activeTurnPromises.set(sessionId, promise)
+        log('info', `session/prompt chat=${m.chatId} session=${sessionId.slice(0, 8)} prompt.blocks=${prompt.length}${att}`)
+        response = (await promise) as { stopReason?: string }
+      } catch (err) {
+        // Session was lost (most often after `gemini --acp` restart —
+        // sessions are in-process state with no persistence). Fall back
+        // to a fresh session and retry the prompt once.
+        const msg = (err as Error).message
+        const sessionLost =
+          msg.includes('Session not found') ||
+          msg.includes('session not found') ||
+          msg.includes('unknown sessionId')
+        if (!sessionLost) throw err
+        log('warn', `session ${sessionId.slice(0, 8)} lost (likely after gemini restart); opening fresh session`)
+        activeTurnPromises.delete(sessionId)
+        await sessionMap.clear(m.chatId)
+        const fresh = await gemini.sessionNew(DEFAULT_CWD)
+        const newSessionId = fresh.sessionId
+        await sessionMap.set(m.chatId, newSessionId)
+        sessionToChat.delete(sessionId)
+        sessionToChat.set(newSessionId, m.chatId)
+        log('info', `session/new (auto-recovery) chat=${m.chatId} sessionId=${newSessionId.slice(0, 8)}`)
+        // Rebind cancel ref + stop message to the new session id so the
+        // ⛔ button still works.
+        if (cancelRefToSession.get(cancelRef) === sessionId) {
+          cancelRefToSession.set(cancelRef, newSessionId)
+        }
+        const stop = stopMessageBySession.get(sessionId)
+        if (stop) {
+          stopMessageBySession.delete(sessionId)
+          stopMessageBySession.set(newSessionId, stop)
+        }
+        sessionId = newSessionId
+        const retryPromise = gemini.sessionPrompt(sessionId, prompt)
+        activeTurnPromises.set(sessionId, retryPromise)
+        log('info', `session/prompt retry chat=${m.chatId} session=${sessionId.slice(0, 8)} prompt.blocks=${prompt.length}${att}`)
+        response = (await retryPromise) as { stopReason?: string }
+      }
+
       activeTurnPromises.delete(sessionId)
       log('info', `session/prompt complete chat=${m.chatId} stopReason=${response?.stopReason ?? '?'}`)
       // Remove the cancel ref + tidy the Stop message.
