@@ -136,27 +136,44 @@ verbatim, the zero-degradation invariants are intact.
 
 | File | Purpose |
 |---|---|
-| `src/codex-client.ts` | WebSocket JSON-RPC client. Audit rules #1/#2/#4. |
-| `src/telegram-client.ts` | grammy bot with access.json allowlist + ackReaction. |
+| `src/codex-client.ts` | WebSocket JSON-RPC client; handles responses, notifications, **and** server-to-client requests (e.g. approval prompts). Audit rules #1/#2/#4. |
+| `src/telegram-client.ts` | grammy bot with access.json allowlist + ackReaction + inline-keyboard helper + `callback_query` handler for approval clicks. |
+| `src/turn-stream-consumer.ts` | Per-agentMessage streaming consumer ported from Hermes `gateway/stream_consumer.py`: queue + single-task drain, 1 s edit interval, adaptive backoff to 10 s on Telegram 429, fallback to one-shot send after 3 strikes. |
+| `src/approval-tracker.ts` | Maps short `cbId` → pending JSON-RPC reply callbacks. User's button click resolves the approval. |
 | `src/item-formatter.ts` | Render every `ThreadItem` type to a TG-friendly string. |
 | `src/session-map.ts` | Persistent chat_id → thread_id mapping. |
-| `src/server.ts` | Bridge daemon orchestrating both clients. |
+| `src/server.ts` | Bridge daemon orchestrating all of the above. |
 | `scripts/smoke-test.ts` | Bypasses TG; verifies codex side end-to-end. |
 | `launchd/*.plist.template` | LaunchAgent templates (run via `install.sh`). |
 | `launchd/install.sh` | Substitute `USER` / `NAME` / `PORT` / `STATE_DIR` and write plists. |
+
+## Capabilities (as of 0.1.0 — see [CHANGELOG.md](./CHANGELOG.md))
+
+- ✅ Telegram ↔ codex app-server JSON-RPC bridge with five audit
+  invariants enforced in code.
+- ✅ Real-time streaming of `agentMessage` deltas (Hermes-pattern
+  consumer, 1 s edit interval, adaptive backoff).
+- ✅ Other `item/*` types (commandExecution, fileChange, reasoning,
+  mcpToolCall, plan, etc.) render via formatter and post as separate
+  TG messages.
+- ✅ Persistent chat ↔ thread mapping (`state/session-map.json`),
+  resumes after restart.
+- ✅ Inline-keyboard **approval flow**: codex `requestApproval`
+  prompts (command exec / file change / permissions) surface in
+  Telegram with Accept / Accept-for-session / Decline buttons.
+- ✅ Smoke test that proves codex side honours `~/.codex/config.toml`
+  and AGENTS.md and round-trips the user prompt verbatim.
 
 ## Limitations / known gaps
 
 - **One thread per TG chat.** Forum topics, threaded replies, and group
   chats are not yet supported.
-- **No human-approval flow.** `approvalPolicy` defaults to whatever your
-  `~/.codex/config.toml` says — typically `on-request`. If Codex asks for
-  approval, the bridge currently logs the request but doesn't surface it
-  to Telegram. Approval is auto-denied by timeout. Set
-  `approvalPolicy = "never"` in config.toml for unattended use, or wire up
-  TG-side approval routing as a follow-up.
-- **No attachments in.** Inbound: text only. Outbound: text only (no
-  image or file replies yet).
+- **No attachments.** Inbound: text only. Outbound: text only.
+- **No interrupt/cancel control** for a running turn from the chat
+  side. The user has to wait for codex to finish.
+- **No timeout on pending approvals.** If you never click a button,
+  the JSON-RPC reply slot stays open until codex's own internal
+  approval timeout (if any) fires.
 - **Single-user.** Designed for personal use; multi-user with isolation
   would need per-user state dirs and a more elaborate access model.
 
