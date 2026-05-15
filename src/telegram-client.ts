@@ -16,7 +16,7 @@
  * client only implements the surface the bridge needs.
  */
 
-import { Bot, type Context, GrammyError } from 'grammy'
+import { Bot, type Context, GrammyError, InlineKeyboard } from 'grammy'
 import { readFile } from 'node:fs/promises'
 import { EventEmitter } from 'node:events'
 
@@ -53,6 +53,39 @@ export class TelegramClient extends EventEmitter {
       } catch (err) {
         this.emit('error', err)
       }
+    })
+
+    // Inline-button clicks for approval prompts. callback_data follows
+    // the shape `appr:<cbId>:<decision>`. We parse and re-emit so
+    // server.ts can resolve the pending JSON-RPC reply.
+    this.bot.on('callback_query:data', async ctx => {
+      const data = ctx.callbackQuery.data
+      if (!data?.startsWith('appr:')) {
+        await ctx.answerCallbackQuery().catch(() => {})
+        return
+      }
+      const parts = data.split(':')
+      if (parts.length !== 3) {
+        await ctx.answerCallbackQuery({ text: 'malformed callback_data' }).catch(() => {})
+        return
+      }
+      const [, cbId, decision] = parts
+      // Reload access — same as inbound messages — and only honour
+      // approvals from allowlisted users.
+      if (Date.now() - this.accessLoadedAt > 5000) await this.reloadAccess()
+      const fromId = ctx.from?.id
+      if (!fromId || !this.isAllowed(String(fromId))) {
+        await ctx.answerCallbackQuery({ text: 'not authorized', show_alert: true }).catch(() => {})
+        return
+      }
+      this.emit('approval', {
+        cbId,
+        decision,
+        chatId: String(ctx.chat?.id ?? ''),
+        messageId: ctx.callbackQuery.message?.message_id,
+        userId: String(fromId),
+      })
+      await ctx.answerCallbackQuery({ text: `${decision}` }).catch(() => {})
     })
 
     this.bot.catch(err => this.emit('error', err))
@@ -168,5 +201,27 @@ export class TelegramClient extends EventEmitter {
     } catch {
       // Telegram emoji whitelist rejects; swallow.
     }
+  }
+
+  /**
+   * Send a message with an inline keyboard. Used for approval prompts.
+   * `buttons` is an array of rows; each row is an array of
+   * `{ text, data }` entries. Returns the new message id so callers can
+   * edit the message after a click (e.g. to show "✅ accepted by Joey").
+   */
+  async sendWithButtons(
+    chatId: string,
+    text: string,
+    buttons: ReadonlyArray<ReadonlyArray<{ text: string; data: string }>>,
+  ): Promise<number> {
+    const kb = new InlineKeyboard()
+    buttons.forEach((row, rowIdx) => {
+      row.forEach(btn => kb.text(btn.text, btn.data))
+      if (rowIdx < buttons.length - 1) kb.row()
+    })
+    const sent = await this.bot.api.sendMessage(chatId, text, {
+      reply_markup: kb,
+    })
+    return sent.message_id
   }
 }

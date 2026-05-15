@@ -31,6 +31,7 @@ import { TelegramClient, type InboundMessage } from './telegram-client.ts'
 import { SessionMap } from './session-map.ts'
 import { formatItem } from './item-formatter.ts'
 import { TurnStreamConsumer } from './turn-stream-consumer.ts'
+import { ApprovalTracker, type ApprovalType } from './approval-tracker.ts'
 import { config as loadDotenv } from 'dotenv'
 import { existsSync } from 'node:fs'
 
@@ -109,31 +110,109 @@ async function main(): Promise<void> {
   // shell command / apply a file change / amend permissions. We MUST
   // respond by `id` or codex blocks indefinitely.
   //
-  // Current policy: auto-approve (matches `--dangerously-skip-permissions`
-  // for claude code). The bridge's whole point is unattended remote
-  // operation — if Joey wanted approval prompts he'd be at the terminal
-  // running `codex` directly. A future enhancement could forward each
-  // approval to Telegram with inline yes/no buttons.
-  codex.on('serverRequest', (method: string, params: any, reply: (result: unknown) => void) => {
-    const cmd = params?.command ? ` cmd=\`${String(params.command).slice(0, 80)}\`` : ''
-    const itemId = params?.itemId ? ` item=${String(params.itemId).slice(0, 12)}` : ''
-    log('info', `← codex REQUEST: ${method}${itemId}${cmd} → auto-approve`)
+  // Policy: forward each approval to Telegram as an inline-keyboard
+  // prompt so the user can decide (Accept / Accept for session /
+  // Decline). The bridge is for trusted personal use over a long arm —
+  // auto-approving would defeat the safety net users get from codex's
+  // approval policy.
+  const approvals = new ApprovalTracker()
+
+  function approvalTypeFromMethod(method: string): ApprovalType | null {
     switch (method) {
       case 'item/commandExecution/requestApproval':
-        // CommandExecutionApprovalDecision = "accept" | "acceptForSession" | ...
-        reply({ decision: 'acceptForSession' })
-        break
+        return 'commandExecution'
       case 'item/fileChange/requestApproval':
-        // FileChangeApprovalDecision = "accept" | "decline" | ...
-        reply({ decision: 'accept' })
-        break
+        return 'fileChange'
       case 'permissions/requestApproval':
-        // PermissionsRequestApprovalResponse — accept the proposed amendment
-        reply({ decision: 'accept' })
-        break
+        return 'permissions'
       default:
-        log('warn', `unknown server request ${method}; auto-replying with empty result`)
-        reply({})
+        return null
+    }
+  }
+
+  function approvalButtons(type: ApprovalType): Array<Array<{ text: string; data: string }>> {
+    // callback_data: appr:<cbId>:<decision> (placeholder; real cbId
+    // substituted by caller per registered ApprovalTracker entry).
+    if (type === 'commandExecution') {
+      return [
+        [
+          { text: '✅ Accept', data: 'appr:CBID:accept' },
+          { text: '🔁 Accept for session', data: 'appr:CBID:acceptForSession' },
+        ],
+        [{ text: '❌ Decline', data: 'appr:CBID:decline' }],
+      ]
+    }
+    return [
+      [
+        { text: '✅ Accept', data: 'appr:CBID:accept' },
+        { text: '❌ Decline', data: 'appr:CBID:decline' },
+      ],
+    ]
+  }
+
+  function describeApproval(method: string, params: any): string {
+    const reason = params?.reason ? `\nreason: ${params.reason}` : ''
+    if (method === 'item/commandExecution/requestApproval') {
+      const cwd = params?.cwd ? `\ncwd: \`${params.cwd}\`` : ''
+      const cmd = params?.command ? `\n\`\`\`\n${String(params.command).slice(0, 800)}\n\`\`\`` : ''
+      return `🛂 codex wants to run a shell command${cwd}${cmd}${reason}`
+    }
+    if (method === 'item/fileChange/requestApproval') {
+      const changes = params?.changes ?? params?.fileChange ?? []
+      const summary = Array.isArray(changes)
+        ? changes
+            .map((c: any) => `  ${c.type ?? 'change'}: ${c.path ?? '?'}`)
+            .slice(0, 6)
+            .join('\n')
+        : JSON.stringify(params ?? {}).slice(0, 600)
+      return `🛂 codex wants to apply a file change\n${summary}${reason}`
+    }
+    if (method === 'permissions/requestApproval') {
+      return `🛂 codex wants to amend permissions\n${JSON.stringify(params ?? {}, null, 2).slice(0, 1500)}${reason}`
+    }
+    return `🛂 codex requests approval (${method})\n${JSON.stringify(params ?? {}, null, 2).slice(0, 1500)}`
+  }
+
+  codex.on('serverRequest', async (method: string, params: any, reply: (result: unknown) => void) => {
+    const type = approvalTypeFromMethod(method)
+    const threadId: string | undefined = params?.threadId
+    const itemId: string | undefined = params?.itemId
+    const chatId = threadId ? threadToChat.get(threadId) : undefined
+
+    if (!type || !threadId || !itemId || !chatId) {
+      log('warn', `cannot route approval ${method}: type=${type} thread=${threadId} item=${itemId} chat=${chatId}; auto-declining`)
+      reply({ decision: 'decline' })
+      return
+    }
+
+    const cbId = approvals.register(type, { threadId, itemId }, reply)
+    const text = describeApproval(method, params)
+    const buttons = approvalButtons(type).map(row =>
+      row.map(b => ({ text: b.text, data: b.data.replace('CBID', cbId) })),
+    )
+    try {
+      await tg.sendWithButtons(chatId, text, buttons)
+      log('info', `← codex REQUEST: ${method} item=${itemId.slice(0, 12)} → waiting for TG approval (cbId=${cbId})`)
+    } catch (err) {
+      log('warn', `failed to send approval prompt for ${method}: ${(err as Error).message}; auto-declining`)
+      // Resolve the tracker to release the entry then signal decline.
+      approvals.resolve(cbId, 'decline')
+    }
+  })
+
+  // User clicked an approval button in Telegram.
+  tg.on('approval', (ev: { cbId: string; decision: string; chatId: string; messageId?: number }) => {
+    const res = approvals.resolve(ev.cbId, ev.decision)
+    if (!res.ok) {
+      log('warn', `approval click ignored: ${res.reason}`)
+      return
+    }
+    log('info', `approval cbId=${ev.cbId} type=${res.type} → ${ev.decision} (user decision sent to codex)`)
+    // Edit the prompt message to remove buttons + show the outcome.
+    if (ev.messageId) {
+      void tg
+        .editMessage(ev.chatId, ev.messageId, `🛂 ${ev.decision} — sent to codex.`)
+        .catch(() => {})
     }
   })
 
