@@ -2,6 +2,68 @@
 
 All notable changes to this project. Versions follow [SemVer](https://semver.org/).
 
+## [Unreleased] — 2026-05-15 (later in day)
+
+### Added — `gemini-tg-bridge`
+
+A second bridge in the same repo, sharing the supporting modules
+(TelegramClient, SessionMap, TurnStreamConsumer) with the original
+codex bridge. The protocol layer is different: Codex uses its
+WebSocket app-server JSON-RPC; Gemini speaks the Agent Client Protocol
+(ACP) over a stdio subprocess. Same five audit invariants apply.
+
+- **`src/gemini-client.ts`** — spawns `gemini --acp` as a long-lived
+  stdio subprocess, frames JSON-RPC 2.0 as NDJSON (one frame per line).
+  Implements `initialize`, `session/new`, `session/load`,
+  `session/prompt`, `session/cancel`. Handles bidirectional requests
+  (`session/request_permission`) so the bridge can route ACP approval
+  prompts to Telegram.
+- **`src/acp-item-formatter.ts`** — renders ACP `session/update` payloads
+  (plan / tool_call / tool_call_update / agent_thought_chunk /
+  available_commands_update / etc.) to Telegram-friendly strings.
+  `agent_message_chunk` is suppressed here and routed to
+  `TurnStreamConsumer` for in-place streaming edits, matching the
+  codex bridge's behaviour.
+- **`src/gemini-server.ts`** — daemon entry point parallel to
+  `src/server.ts`. Reuses TelegramClient + SessionMap +
+  TurnStreamConsumer. Dynamic inline-keyboard approval flow: each
+  button surfaces one of the server-supplied `options` (ACP's design
+  is "agent provides options, client picks", vs codex's fixed enum).
+- **`scripts/smoke-test-gemini.ts`** — TG-bypassing smoke test against
+  `gemini --acp`. Verifies initialize → session/new → session/prompt →
+  stopReason=end_turn. Used to confirm the codex-side smoke pattern
+  works on the gemini side too.
+- **`launchd/com.btai.gemini-tg-bridge.scout.plist.template`** — single
+  LaunchAgent (no separate appserver needed; gemini-server.ts owns the
+  gemini --acp lifecycle). Uses the same `@@PLACEHOLDER@@` sentinel
+  pattern as the codex templates.
+- **`package.json`**: new `start-gemini` script.
+
+### Changed — codex bridge
+
+- **Boot-time auth guard** (`src/codex-client.ts:assertSubscriptionAuth`).
+  Refuses to start if `~/.codex/auth.json` reports `auth_mode: "apikey"`.
+  Background: this caught us out — `@scout_Codex_bot` had been running
+  for a day on API token billing (pay-per-turn) instead of the
+  ChatGPT subscription it was supposed to use. The guard matches the
+  Gemini side's existing `assertSubscriptionBilling()` env check, so
+  neither bridge can silently switch to API billing.
+  To recover: `codex logout && codex login` (browser-based ChatGPT
+  sign-in), then `launchctl bootout`/`bootstrap` the appserver.
+
+### Background — why a separate file
+
+Codex CLI and Gemini CLI ship different agent protocols (Codex
+app-server WebSocket vs Gemini ACP stdio). They can't share a single
+protocol client without losing per-agent fidelity, so the bridge keeps
+one client class per agent and shares the platform-side modules
+(streaming consumer, Telegram surface, approval tracker, session map).
+The naming is now slightly mismatched (`codex-tg-bridge` repo name vs
+multi-agent reality) — kept as-is to avoid breaking the deployed
+LaunchAgents until a v0.2 rename.
+
+---
+
 ## [0.1.0] — 2026-05-15
 
 Initial implementation + iterative debug shaping. All changes below

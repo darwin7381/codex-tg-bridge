@@ -1,0 +1,58 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  gemini-tg-bridge LaunchAgent. Unlike codex-tg-bridge (which needs a
+  paired `codex app-server --listen ws://` daemon), this is ONE process:
+  gemini-server.ts spawns `gemini --acp` as a stdio subprocess and
+  manages its lifetime.
+
+  install-gemini.sh substitutes:
+    @@NAME@@         short identifier (e.g. "scout")
+    @@STATE_DIR@@    e.g. /Users/USER/.codex-tg-bridge/state/gemini-<NAME>
+    @@USER@@         your unix username
+
+  Prereq:
+    - gemini-cli installed (`npm install -g @google/gemini-cli`)
+    - `gemini auth` logged in via Google OAuth (Gemini subscription)
+    - $STATE_DIR/.env contains TELEGRAM_BOT_TOKEN=...
+    - $STATE_DIR/access.json with dmPolicy + approved list
+    - NO `GEMINI_API_KEY` / `GOOGLE_API_KEY` / `GOOGLE_GENAI_USE_VERTEXAI`
+      in env (gemini-server.ts refuses to start otherwise; protects
+      against the $150 API-billing trap)
+
+  Load: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<this>.plist
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.btai.gemini-tg-bridge.@@NAME@@</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/@@USER@@/.bun/bin/bun</string>
+    <string>run</string>
+    <string>start-gemini</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/@@USER@@/codex-tg-bridge</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/@@USER@@/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>/Users/@@USER@@</string>
+    <key>BRIDGE_STATE_DIR</key><string>@@STATE_DIR@@</string>
+    <!-- Optional. Leave commented to use the bridge process's own cwd
+         (gemini-server.ts default: WorkingDirectory above). Per audit
+         rule #2 we don't override cwd per-turn — set once here or in
+         BRIDGE_DEFAULT_CWD; gemini-cli sees it via session/new params. -->
+    <!-- <key>BRIDGE_DEFAULT_CWD</key><string>/Users/@@USER@@/cc-workspaces/@@NAME@@</string> -->
+  </dict>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+
+  <key>StandardOutPath</key><string>@@STATE_DIR@@/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>@@STATE_DIR@@/launchd.err.log</string>
+</dict>
+</plist>
