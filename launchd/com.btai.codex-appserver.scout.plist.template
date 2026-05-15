@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  codex app-server LaunchAgent — runs the persistent JSON-RPC server that
+  the codex-tg-bridge connects to. Lives entirely separately from any TG
+  bridge so multiple bridges (or a VS Code extension) could share it.
+
+  install.sh substitutes:
+    @@NAME@@         short identifier for this codex instance (e.g. "scout")
+    @@PORT@@         TCP port for ws://127.0.0.1:PORT (one per instance)
+    @@USER@@         your unix username
+
+  Manual install: run `./launchd/install.sh <NAME> <PORT> [STATE_DIR]`.
+  Load: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<this>.plist
+  Unload: launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/<this>.plist
+  Logs: ~/.codex-tg-bridge/logs/codex-appserver-<NAME>.{out,err}.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.btai.codex-appserver.@@NAME@@</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/codex</string>
+    <string>app-server</string>
+    <string>--listen</string>
+    <string>ws://127.0.0.1:@@PORT@@</string>
+  </array>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>/Users/@@USER@@</string>
+    <!-- Uncomment to use an isolated $CODEX_HOME (separate auth, config,
+         sessions). Default points at ~/.codex shared with the CLI. -->
+    <!-- <key>CODEX_HOME</key><string>/Users/@@USER@@/.codex-@@NAME@@</string> -->
+  </dict>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/@@USER@@</string>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+
+  <key>StandardOutPath</key><string>/Users/@@USER@@/.codex-tg-bridge/logs/codex-appserver-@@NAME@@.out.log</string>
+  <key>StandardErrorPath</key><string>/Users/@@USER@@/.codex-tg-bridge/logs/codex-appserver-@@NAME@@.err.log</string>
+</dict>
+</plist>

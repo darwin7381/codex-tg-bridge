@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  codex-tg-bridge LaunchAgent — the thin TG↔codex JSON-RPC bridge.
+
+  install.sh substitutes:
+    @@NAME@@         short identifier (must match the paired codex-appserver)
+    @@PORT@@         matching ws port from com.btai.codex-appserver.<NAME>
+    @@STATE_DIR@@    e.g. /Users/USER/.codex-tg-bridge/state/<NAME>
+    @@USER@@         your unix username
+
+  Prereq:
+    - paired com.btai.codex-appserver.<NAME>.plist already bootstrapped
+    - $STATE_DIR/.env contains TELEGRAM_BOT_TOKEN=...
+    - $STATE_DIR/access.json with dmPolicy + approved list
+
+  Manual install: run `./launchd/install.sh <NAME> <PORT> [STATE_DIR]`.
+  Load: launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/<this>.plist
+  Unload: launchctl bootout gui/$(id -u) ~/Library/LaunchAgents/<this>.plist
+  Logs: $STATE_DIR/launchd.{out,err}.log
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.btai.codex-tg-bridge.@@NAME@@</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/@@USER@@/.bun/bin/bun</string>
+    <string>run</string>
+    <string>start</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/@@USER@@/codex-tg-bridge</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key><string>/Users/@@USER@@/.bun/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key><string>/Users/@@USER@@</string>
+    <key>BRIDGE_STATE_DIR</key><string>@@STATE_DIR@@</string>
+    <key>CODEX_APPSERVER_URL</key><string>ws://127.0.0.1:@@PORT@@</string>
+    <!-- Optional: set the codex cwd for new threads. If unset, the
+         app-server uses its own startup cwd (~/@@USER@@ per the appserver
+         plist's WorkingDirectory). Per audit rule #2 the bridge does NOT
+         override cwd per-turn — set it once here, codex inherits it. -->
+    <!-- <key>BRIDGE_DEFAULT_CWD</key><string>/Users/@@USER@@/cc-workspaces/@@NAME@@</string> -->
+  </dict>
+
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>ThrottleInterval</key><integer>10</integer>
+
+  <key>StandardOutPath</key><string>@@STATE_DIR@@/launchd.out.log</string>
+  <key>StandardErrorPath</key><string>@@STATE_DIR@@/launchd.err.log</string>
+</dict>
+</plist>
