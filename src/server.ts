@@ -32,6 +32,7 @@ import { SessionMap } from './session-map.ts'
 import { formatItem } from './item-formatter.ts'
 import { TurnStreamConsumer } from './turn-stream-consumer.ts'
 import { ApprovalTracker, type ApprovalType } from './approval-tracker.ts'
+import { attachmentsToCodexInput } from './attachment-to-input.ts'
 import { config as loadDotenv } from 'dotenv'
 import { existsSync } from 'node:fs'
 
@@ -328,10 +329,17 @@ async function main(): Promise<void> {
       threadToChat.set(threadId, m.chatId)
     }
 
-    // Audit rule #3: raw text, no prefix/suffix.
+    // Audit rule #3: raw text + raw localImage paths. attachmentsToCodexInput
+    // does NOT add any wrapping / framing — it just maps Attachment[] to
+    // codex's UserInput shape and concatenates mention lines for media
+    // codex can't ingest natively (audio, video).
     try {
-      await codex.turnStart(threadId, m.text)
-      log('info', `turn/start chat=${m.chatId} threadId=${threadId.slice(0, 8)} input.len=${m.text.length}`)
+      const input = await attachmentsToCodexInput(m.text, m.attachments)
+      await codex.turnStart(threadId, input)
+      const att = m.attachments.length
+        ? ` attachments=[${m.attachments.map(a => a.kind).join(',')}]`
+        : ''
+      log('info', `turn/start chat=${m.chatId} threadId=${threadId.slice(0, 8)} input.blocks=${input.length}${att}`)
     } catch (err) {
       log('error', `turn/start failed: ${(err as Error).message}`)
       await tg.reply(m.chatId, `❌ codex turn/start failed: ${(err as Error).message}`)

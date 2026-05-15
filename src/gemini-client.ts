@@ -269,14 +269,19 @@ export class GeminiClient extends EventEmitter {
   }
 
   /**
-   * Audit rules #2 + #3: send ONLY the raw user text wrapped as a single
-   * `text` ContentBlock. No model override, no system framing. The
-   * response carries `stopReason` when the turn ends.
+   * Audit rules #2 + #3: send ONLY the prompt content blocks. Use the
+   * single-string overload for plain text; pass an array for mixed
+   * multimedia (text + image + audio + resource_link).
    */
-  sessionPrompt(sessionId: string, text: string): Promise<PromptResponse> {
+  sessionPrompt(
+    sessionId: string,
+    prompt: string | ReadonlyArray<unknown>,
+  ): Promise<PromptResponse> {
+    const promptArr =
+      typeof prompt === 'string' ? [{ type: 'text', text: prompt }] : prompt
     return this.send<PromptResponse>('session/prompt', {
       sessionId,
-      prompt: [{ type: 'text', text }],
+      prompt: promptArr,
     })
   }
 
