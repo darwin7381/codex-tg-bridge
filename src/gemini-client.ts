@@ -288,4 +288,38 @@ export class GeminiClient extends EventEmitter {
   sessionCancel(sessionId: string): Promise<unknown> {
     return this.send('session/cancel', { sessionId })
   }
+
+  /**
+   * Switch the session into one of the agent's modes. Discovered method
+   * names from gemini-cli's acpClient.js: `session/set_mode` returns
+   * `{ available_modes }` or similar; the active mode is then
+   * referenced on subsequent prompt turns.
+   *
+   * Gemini exposes: default | autoEdit | yolo | plan (see the
+   * `modes.availableModes` array on session/new response).
+   */
+  sessionSetMode(sessionId: string, modeId: string): Promise<unknown> {
+    return this.send('session/set_mode', { sessionId, modeId })
+  }
+
+  /**
+   * Change the active model for an in-flight session. Marked
+   * `unstable_` in gemini-cli but the wire method works. Available
+   * model ids surfaced in `models.availableModels` on session/new.
+   */
+  sessionSetModel(sessionId: string, modelId: string): Promise<unknown> {
+    return this.send('session/set_model', { sessionId, modelId })
+  }
+
+  /**
+   * Invoke one of the agent's slash commands directly. Examples from
+   * the `available_commands_update` notification:
+   *   `memory show` / `memory list` / `memory add <text>`
+   *   `extensions list` / `extensions enable <name>`
+   *   `init` (analyzes project, writes GEMINI.md)
+   *   `restore` / `restore list` (checkpoint system)
+   */
+  sessionHandleCommand(sessionId: string, command: string): Promise<unknown> {
+    return this.send('session/handle_command', { sessionId, command })
+  }
 }

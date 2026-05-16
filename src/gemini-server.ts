@@ -26,8 +26,10 @@ import { SessionMap } from './session-map.ts'
 import { TurnStreamConsumer } from './turn-stream-consumer.ts'
 import { formatAcpUpdate } from './acp-item-formatter.ts'
 import { attachmentsToAcpContent } from './attachment-to-input.ts'
+import { SlashCommandRouter } from './slash-commands.ts'
 import { config as loadDotenv } from 'dotenv'
-import { existsSync } from 'node:fs'
+import { existsSync, readdirSync, statSync } from 'node:fs'
+import { join, basename } from 'node:path'
 import { randomBytes } from 'node:crypto'
 
 function loadStateDirEnv(stateDir: string): void {
@@ -120,13 +122,26 @@ async function main(): Promise<void> {
     }
     const sessionId: string | undefined = params?.sessionId
     const toolCall = params?.toolCall ?? {}
-    const options: Array<{ optionId: string; name: string; kind?: string }> = params?.options ?? []
+    let options: Array<{ optionId: string; name: string; kind?: string }> = params?.options ?? []
     const chatId = sessionId ? sessionToChat.get(sessionId) : undefined
 
-    if (!sessionId || !chatId || options.length === 0) {
-      log('warn', `cannot route permission request: session=${sessionId} chat=${chatId} options=${options.length}`)
+    if (!sessionId || !chatId) {
+      log('warn', `cannot route permission request: session=${sessionId} chat=${chatId}`)
       reply({ outcome: { outcome: 'cancelled' } })
       return
+    }
+
+    // Defensive: if the agent supplied no options (some custom tools
+    // like ask_user / exit_plan_mode arrive without an explicit option
+    // set), synthesize Approve/Decline so the user can still respond
+    // rather than the bridge silently cancelling and deadlocking the
+    // agent.
+    if (options.length === 0) {
+      log('warn', `permission request has 0 options; synthesizing approve/decline for ${toolCall.title ?? 'tool call'}`)
+      options = [
+        { optionId: 'approve', name: '✅ Approve' },
+        { optionId: 'decline', name: '❌ Decline' },
+      ]
     }
 
     // Auto-approve mode: user previously clicked "✋ Auto-approve all"
@@ -311,9 +326,158 @@ async function main(): Promise<void> {
     }
   })
 
+  // --- slash command router ----------------------------------------------
+  // Bridge-managed commands run BEFORE the message is forwarded to gemini
+  // as a prompt. Gemini's own `/memory`, `/extensions`, `/init`, `/restore`
+  // commands are forwarded via `/cmd <rest>` so users can still invoke
+  // them without needing the bridge to know every gemini command name.
+  const slash = new SlashCommandRouter()
+
+  slash.register('new', '', 'drop the saved session and start fresh on the next message', async (_args, ctx) => {
+    await sessionMap.clear(ctx.chatId)
+    await ctx.reply('🆕 next message will start a fresh session.')
+  })
+
+  slash.register('list', '', 'list recent agent sessions on disk for this chat', async (_args, ctx) => {
+    const cur = sessionMap.get(ctx.chatId)
+    const tmpRoot = join(process.env.HOME ?? '', '.gemini', 'tmp', 'codex-tg-bridge')
+    let lines = [`current session: \`${cur ?? '(none)'}\``, '', 'recent sessions on disk:']
+    try {
+      const entries = readdirSync(tmpRoot)
+        .map(name => {
+          const p = join(tmpRoot, name)
+          try {
+            return { name, mtimeMs: statSync(p).mtimeMs }
+          } catch {
+            return null
+          }
+        })
+        .filter((x): x is { name: string; mtimeMs: number } => x !== null)
+        .sort((a, b) => b.mtimeMs - a.mtimeMs)
+        .slice(0, 10)
+      for (const e of entries) {
+        const tag = e.name === cur ? ' ← current' : ''
+        lines.push(`• \`${e.name}\` (mtime ${new Date(e.mtimeMs).toISOString().slice(0, 16)})${tag}`)
+      }
+      if (entries.length === 0) lines.push('(none found under ~/.gemini/tmp/codex-tg-bridge)')
+    } catch (err) {
+      lines.push(`(could not read ${tmpRoot}: ${(err as Error).message})`)
+    }
+    await ctx.reply(lines.join('\n'))
+  })
+
+  slash.register('resume', '<sessionId>', 'switch this chat to a different stored session id', async (args, ctx) => {
+    if (!args) {
+      await ctx.reply('usage: `/resume <sessionId>` — see `/list` for available ids.')
+      return
+    }
+    await sessionMap.set(ctx.chatId, args)
+    await ctx.reply(`✅ resumed session \`${args}\` — next message will attempt session/load.`)
+  })
+
+  slash.register('cancel', '', 'interrupt the currently running turn', async (_args, ctx) => {
+    const sid = sessionMap.get(ctx.chatId)
+    if (!sid) {
+      await ctx.reply('no active session for this chat.')
+      return
+    }
+    try {
+      await gemini.sessionCancel(sid)
+      await ctx.reply('⛔ cancel requested.')
+    } catch (err) {
+      await ctx.reply(`cancel failed: ${(err as Error).message}`)
+    }
+  })
+
+  slash.register('autoapprove', '<on|off>', 'toggle bridge auto-approve for this session', async (args, ctx) => {
+    const sid = sessionMap.get(ctx.chatId)
+    if (!sid) {
+      await ctx.reply('no active session for this chat. send a normal message first to open one.')
+      return
+    }
+    const norm = args.trim().toLowerCase()
+    if (norm === 'on' || norm === 'true' || norm === '1') {
+      autoApprove.add(sid)
+      await ctx.reply('✋ auto-approve ON — bridge will silently accept every permission request for this session.')
+    } else if (norm === 'off' || norm === 'false' || norm === '0') {
+      autoApprove.delete(sid)
+      await ctx.reply('🛂 auto-approve OFF — permission prompts will surface as usual.')
+    } else {
+      await ctx.reply(`status: ${autoApprove.has(sid) ? 'ON' : 'OFF'}. use \`/autoapprove on\` or \`/autoapprove off\`.`)
+    }
+  })
+
+  slash.register('mode', '<default|autoEdit|yolo|plan>', 'switch gemini session mode (yolo = auto-approve everything)', async (args, ctx) => {
+    const sid = sessionMap.get(ctx.chatId)
+    if (!sid) {
+      await ctx.reply('no active session. send a normal message first.')
+      return
+    }
+    const norm = args.trim()
+    if (!norm) {
+      await ctx.reply('usage: `/mode <default|autoEdit|yolo|plan>`')
+      return
+    }
+    try {
+      await gemini.sessionSetMode(sid, norm)
+      await ctx.reply(`🎛 session mode → \`${norm}\``)
+    } catch (err) {
+      await ctx.reply(`set_mode failed: ${(err as Error).message}`)
+    }
+  })
+
+  slash.register('model', '<modelId>', 'switch gemini model for this session (e.g. gemini-3.1-pro-preview, auto-gemini-3)', async (args, ctx) => {
+    const sid = sessionMap.get(ctx.chatId)
+    if (!sid) {
+      await ctx.reply('no active session. send a normal message first.')
+      return
+    }
+    const norm = args.trim()
+    if (!norm) {
+      await ctx.reply('usage: `/model <id>`')
+      return
+    }
+    try {
+      await gemini.sessionSetModel(sid, norm)
+      await ctx.reply(`🧠 session model → \`${norm}\``)
+    } catch (err) {
+      await ctx.reply(`set_model failed: ${(err as Error).message}`)
+    }
+  })
+
+  slash.register('cmd', '<gemini slash-command>', 'forward to gemini (e.g. /cmd memory show, /cmd restore list)', async (args, ctx) => {
+    const sid = sessionMap.get(ctx.chatId)
+    if (!sid) {
+      await ctx.reply('no active session. send a normal message first.')
+      return
+    }
+    if (!args) {
+      await ctx.reply("usage: `/cmd <gemini command>` — see gemini-cli's available commands (memory, extensions, init, restore, ...)")
+      return
+    }
+    try {
+      const result = await gemini.sessionHandleCommand(sid, args)
+      await ctx.reply(`🔧 \`${args}\` → ${JSON.stringify(result).slice(0, 1500)}`)
+    } catch (err) {
+      await ctx.reply(`handle_command failed: ${(err as Error).message}`)
+    }
+  })
+
   // --- inbound TG → gemini -----------------------------------------------
   tg.on('message', async (m: InboundMessage) => {
     log('info', `→ TG msg from chat=${m.chatId} user=${m.username}: ${m.text.slice(0, 80)}`)
+
+    // Bridge-managed slash commands (`/help`, `/mode`, `/cmd`, etc.)
+    // get dispatched before we forward anything to gemini. If a
+    // command is matched, the inbound message is NOT sent as a prompt.
+    if (m.text && m.text.trim().startsWith('/') && m.attachments.length === 0) {
+      const handled = await slash.dispatch(m.text, {
+        chatId: m.chatId,
+        reply: (t: string) => tg.reply(m.chatId, t, m.messageId),
+        log,
+      })
+      if (handled) return
+    }
 
     let sessionId = sessionMap.get(m.chatId)
 
