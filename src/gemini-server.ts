@@ -129,6 +129,19 @@ async function main(): Promise<void> {
       return
     }
 
+    // Auto-approve mode: user previously clicked "✋ Auto-approve all"
+    // for this session. Bridge picks the most-permissive option and
+    // resolves the prompt without bothering the user.
+    if (autoApprove.has(sessionId)) {
+      const picked = pickPermissiveOption(options)
+      if (picked) {
+        reply({ outcome: { outcome: 'selected', optionId: picked.optionId } })
+        log('info', `← gemini permission AUTO: ${toolCall.title ?? 'tool call'} → "${picked.name}" (session in auto-approve mode)`)
+        return
+      }
+      // Couldn't pick — fall through to normal prompt.
+    }
+
     const cbId = randomBytes(4).toString('hex')
     approvals.set(cbId, { reply, options, sessionId })
 
@@ -136,12 +149,17 @@ async function main(): Promise<void> {
     const kind = toolCall.kind ?? 'tool'
     const rawInput = toolCall.rawInput ? `\n\`\`\`\n${JSON.stringify(toolCall.rawInput).slice(0, 600)}\n\`\`\`` : ''
     const text = `🛂 gemini wants permission for ${kind}: **${title}**${rawInput}`
-    const buttonRows = options.map(opt => [
+    // Render each agent-supplied option on its own row, then append a
+    // single "auto-approve everything for this session" override row.
+    const buttonRows: Array<Array<{ text: string; data: string }>> = options.map(opt => [
       { text: opt.name, data: `appr:${cbId}:${opt.optionId}` },
+    ])
+    buttonRows.push([
+      { text: '✋ Auto-approve all (this session)', data: `appr:${cbId}:__BRIDGE_AUTO_ALL__` },
     ])
     try {
       await tg.sendWithButtons(chatId, text, buttonRows)
-      log('info', `← gemini permission: ${title} (${options.length} options) → awaiting TG (cbId=${cbId})`)
+      log('info', `← gemini permission: ${title} (${options.length} options + auto-all) → awaiting TG (cbId=${cbId})`)
     } catch (err) {
       log('warn', `permission TG send failed: ${(err as Error).message}; cancelling`)
       approvals.delete(cbId)
@@ -155,6 +173,33 @@ async function main(): Promise<void> {
       log('warn', `approval cbId=${ev.cbId} not found (already resolved?)`)
       return
     }
+
+    // Special sentinel decision: enable bridge-level auto-approve for
+    // the rest of this session, then resolve THIS prompt with the
+    // agent's most-permissive option so the agent can proceed.
+    if (ev.decision === '__BRIDGE_AUTO_ALL__') {
+      autoApprove.add(entry.sessionId)
+      const picked = pickPermissiveOption(entry.options)
+      if (!picked) {
+        // No safe pick — reject gracefully.
+        entry.reply({ outcome: { outcome: 'cancelled' } })
+      } else {
+        entry.reply({ outcome: { outcome: 'selected', optionId: picked.optionId } })
+      }
+      approvals.delete(ev.cbId)
+      log(
+        'info',
+        `approval cbId=${ev.cbId} → AUTO-APPROVE-ALL enabled for session=${entry.sessionId.slice(0, 8)} (this prompt resolved as "${picked?.name ?? 'cancel'}")`,
+      )
+      if (ev.messageId) {
+        void tg
+          .editMessage(ev.chatId, ev.messageId, `✋ auto-approve all enabled for this session — gemini won't ask again until the session ends`)
+          .catch(() => {})
+        void tg.clearButtons(ev.chatId, ev.messageId).catch(() => {})
+      }
+      return
+    }
+
     // decision is the optionId we asked the user to pick. ACP wants
     // { outcome: { outcome: "selected", optionId: "..." } }
     entry.reply({ outcome: { outcome: 'selected', optionId: ev.decision } })
@@ -165,6 +210,7 @@ async function main(): Promise<void> {
       void tg
         .editMessage(ev.chatId, ev.messageId, `🛂 ${opt?.name ?? ev.decision} — sent to gemini.`)
         .catch(() => {})
+      void tg.clearButtons(ev.chatId, ev.messageId).catch(() => {})
     }
   })
 
@@ -216,6 +262,32 @@ async function main(): Promise<void> {
   // Map cancel-ref → sessionId for the ⛔ Stop button below.
   const cancelRefToSession = new Map<string, string>()
   const stopMessageBySession = new Map<string, { chatId: string; messageId: number }>()
+
+  // Per-session "auto-approve all" toggle. When set, the bridge auto-
+  // replies to every session/request_permission for that session with
+  // the most-permissive option offered by the agent — no TG prompt
+  // shown. Persists in-memory only; gone on bridge restart or session
+  // change.
+  const autoApprove = new Set<string>()
+
+  /** Pick the option most likely to mean "always allow". Heuristic over
+   *  agent-supplied option names; falls back to first option. */
+  function pickPermissiveOption(
+    options: ReadonlyArray<{ optionId: string; name: string; kind?: string }>,
+  ): { optionId: string; name: string; kind?: string } | undefined {
+    if (options.length === 0) return undefined
+    const lc = (s: string): string => s.toLowerCase()
+    // Priority: "always allow" > "allow always" > "allow" > anything with "yes"
+    const byKeyword = (kw: string) => options.find(o => lc(o.name).includes(kw))
+    return (
+      byKeyword('always allow') ??
+      byKeyword('allow always') ??
+      byKeyword('always') ??
+      byKeyword('allow') ??
+      byKeyword('yes') ??
+      options[0]
+    )
+  }
 
   // User clicked ⛔ Stop button.
   tg.on('cancel', async (ev: { ref: string; chatId: string; messageId?: number }) => {
@@ -308,6 +380,10 @@ async function main(): Promise<void> {
         await sessionMap.set(m.chatId, newSessionId)
         sessionToChat.delete(sessionId)
         sessionToChat.set(newSessionId, m.chatId)
+        // The auto-approve flag is session-scoped — when we transparently
+        // open a fresh session, carry the user's intent forward so they
+        // don't have to click the toggle again after every restart.
+        if (autoApprove.delete(sessionId)) autoApprove.add(newSessionId)
         log('info', `session/new (auto-recovery) chat=${m.chatId} sessionId=${newSessionId.slice(0, 8)}`)
         // Rebind cancel ref + stop message to the new session id so the
         // ⛔ button still works.
