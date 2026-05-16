@@ -24,7 +24,7 @@ import { GeminiClient, assertSubscriptionBilling } from './gemini-client.ts'
 import { TelegramClient, type InboundMessage } from './telegram-client.ts'
 import { SessionMap } from './session-map.ts'
 import { TurnStreamConsumer } from './turn-stream-consumer.ts'
-import { formatAcpUpdate } from './acp-item-formatter.ts'
+import { formatAcpUpdate, sanitizeForTg, extractGeneratedPaths } from './acp-item-formatter.ts'
 import { attachmentsToAcpContent } from './attachment-to-input.ts'
 import { SlashCommandRouter } from './slash-commands.ts'
 import { config as loadDotenv } from 'dotenv'
@@ -162,8 +162,31 @@ async function main(): Promise<void> {
 
     const title = toolCall.title ?? 'tool call'
     const kind = toolCall.kind ?? 'tool'
-    const rawInput = toolCall.rawInput ? `\n\`\`\`\n${JSON.stringify(toolCall.rawInput).slice(0, 600)}\n\`\`\`` : ''
-    const text = `🛂 gemini wants permission for ${kind}: **${title}**${rawInput}`
+    // Surface the actual command / diff / args so the user can decide
+    // informed instead of just guessing from a name (Joey HedgeDoc #3).
+    const detailParts: string[] = []
+    const rawInput = toolCall.rawInput ?? toolCall.input
+    if (rawInput && typeof rawInput === 'object') {
+      const cmd = (rawInput as any).command ?? (rawInput as any).cmd
+      if (typeof cmd === 'string') detailParts.push(`\`\`\`\n${sanitizeForTg(cmd).slice(0, 800)}\n\`\`\``)
+      else
+        detailParts.push(`args:\n\`\`\`\n${sanitizeForTg(JSON.stringify(rawInput, null, 2)).slice(0, 800)}\n\`\`\``)
+    }
+    if (Array.isArray(toolCall.content)) {
+      for (const c of toolCall.content.slice(0, 3)) {
+        const t = c?.type
+        if (t === 'diff') {
+          const path = c.path ?? '?'
+          const oldT = sanitizeForTg(String(c.oldText ?? '')).slice(0, 400)
+          const newT = sanitizeForTg(String(c.newText ?? '')).slice(0, 400)
+          detailParts.push(`diff: \`${path}\`\n--- old\n${oldT}\n+++ new\n${newT}`)
+        } else if (t === 'text' && typeof c.text === 'string') {
+          detailParts.push(sanitizeForTg(c.text).slice(0, 600))
+        }
+      }
+    }
+    const detail = detailParts.length > 0 ? '\n\n' + detailParts.join('\n') : ''
+    const text = `🛂 gemini wants permission for ${kind}: **${title}**${detail}`
     // Render each agent-supplied option on its own row, then append a
     // single "auto-approve everything for this session" override row.
     const buttonRows: Array<Array<{ text: string; data: string }>> = options.map(opt => [
@@ -247,10 +270,11 @@ async function main(): Promise<void> {
       // Streaming text. agent_thought_chunk is reasoning we hide;
       // agent_message_chunk is the user-facing reply.
       if (kind !== 'agent_message_chunk') return
-      const text: string =
+      const raw: string =
         (typeof update.content?.text === 'string' && update.content.text) ||
         (typeof update.content === 'string' && update.content) ||
         ''
+      const text = sanitizeForTg(raw)
       if (!text) return
       let consumer = turnConsumers.get(sessionId)
       if (!consumer) {
@@ -270,6 +294,23 @@ async function main(): Promise<void> {
         await tg.reply(chatId, rendered)
       } catch (err) {
         log('warn', `acp update reply failed: ${(err as Error).message}`)
+      }
+    }
+
+    // Outbound media: if the agent just produced an image / PDF /
+    // archive / video / audio file on disk, surface it to Telegram
+    // as a photo or document instead of leaving the user with a
+    // path-string mention.
+    for (const p of extractGeneratedPaths(update)) {
+      const ext = p.toLowerCase().split('.').pop() ?? ''
+      try {
+        if (['png', 'jpg', 'jpeg', 'gif', 'webp', 'heic'].includes(ext)) {
+          await tg.sendPhoto(chatId, p, `📸 ${p}`)
+        } else if (['pdf', 'zip', 'tar', 'gz', 'mp4', 'mov', 'wav', 'mp3', 'm4a'].includes(ext)) {
+          await tg.sendDocument(chatId, p, `📎 ${p}`)
+        }
+      } catch (err) {
+        log('warn', `outbound media (${p}) failed: ${(err as Error).message}`)
       }
     }
   })
@@ -338,30 +379,51 @@ async function main(): Promise<void> {
     await ctx.reply('🆕 next message will start a fresh session.')
   })
 
-  slash.register('list', '', 'list recent agent sessions on disk for this chat', async (_args, ctx) => {
+  slash.register('list', '', 'list recent gemini sessions (with title + last activity)', async (_args, ctx) => {
     const cur = sessionMap.get(ctx.chatId)
-    const tmpRoot = join(process.env.HOME ?? '', '.gemini', 'tmp', 'codex-tg-bridge')
-    let lines = [`current session: \`${cur ?? '(none)'}\``, '', 'recent sessions on disk:']
+    const lines = [`current session: \`${cur ?? '(none)'}\``, '']
     try {
-      const entries = readdirSync(tmpRoot)
-        .map(name => {
-          const p = join(tmpRoot, name)
-          try {
-            return { name, mtimeMs: statSync(p).mtimeMs }
-          } catch {
-            return null
-          }
-        })
-        .filter((x): x is { name: string; mtimeMs: number } => x !== null)
-        .sort((a, b) => b.mtimeMs - a.mtimeMs)
-        .slice(0, 10)
-      for (const e of entries) {
-        const tag = e.name === cur ? ' ← current' : ''
-        lines.push(`• \`${e.name}\` (mtime ${new Date(e.mtimeMs).toISOString().slice(0, 16)})${tag}`)
+      const r = await gemini.sessionList(DEFAULT_CWD)
+      const top = r.sessions.slice(0, 15)
+      if (top.length === 0) {
+        lines.push('(no sessions returned by gemini)')
+      } else {
+        lines.push(`gemini sessions (${r.sessions.length} total, showing ${top.length}):`)
+        for (const s of top) {
+          const tag = s.sessionId === cur ? ' ← current' : ''
+          const updated = s.updatedAt ? new Date(s.updatedAt).toISOString().slice(0, 16) : '?'
+          const title = s.title ?? '(untitled)'
+          lines.push(`• \`${s.sessionId.slice(0, 8)}…\` ${updated}  ${title}${tag}`)
+        }
+        lines.push('', 'use `/resume <full-sessionId>` to switch.')
       }
-      if (entries.length === 0) lines.push('(none found under ~/.gemini/tmp/codex-tg-bridge)')
     } catch (err) {
-      lines.push(`(could not read ${tmpRoot}: ${(err as Error).message})`)
+      lines.push(
+        `(session/list failed: ${(err as Error).message})`,
+        '',
+        'fallback — disk scan of ~/.gemini/tmp/codex-tg-bridge:',
+      )
+      try {
+        const tmpRoot = join(process.env.HOME ?? '', '.gemini', 'tmp', 'codex-tg-bridge')
+        const entries = readdirSync(tmpRoot)
+          .map(name => {
+            const p = join(tmpRoot, name)
+            try {
+              return { name, mtimeMs: statSync(p).mtimeMs }
+            } catch {
+              return null
+            }
+          })
+          .filter((x): x is { name: string; mtimeMs: number } => x !== null)
+          .sort((a, b) => b.mtimeMs - a.mtimeMs)
+          .slice(0, 10)
+        for (const e of entries) {
+          const tag = e.name === cur ? ' ← current' : ''
+          lines.push(`• \`${e.name}\` (mtime ${new Date(e.mtimeMs).toISOString().slice(0, 16)})${tag}`)
+        }
+      } catch {
+        lines.push('(disk scan also failed)')
+      }
     }
     await ctx.reply(lines.join('\n'))
   })
@@ -445,21 +507,49 @@ async function main(): Promise<void> {
     }
   })
 
-  slash.register('cmd', '<gemini slash-command>', 'forward to gemini (e.g. /cmd memory show, /cmd restore list)', async (args, ctx) => {
-    const sid = sessionMap.get(ctx.chatId)
+  slash.register('cmd', '<gemini slash-command>', 'forward to gemini (memory show / extensions list / init / restore list / ...)', async (args, ctx) => {
+    let sid = sessionMap.get(ctx.chatId)
     if (!sid) {
-      await ctx.reply('no active session. send a normal message first.')
-      return
+      // Open a session first so gemini has somewhere to route the command.
+      try {
+        const r = await gemini.sessionNew(DEFAULT_CWD)
+        sid = r.sessionId
+        await sessionMap.set(ctx.chatId, sid)
+        sessionToChat.set(sid, ctx.chatId)
+      } catch (err) {
+        await ctx.reply(`could not open session: ${(err as Error).message}`)
+        return
+      }
     }
     if (!args) {
-      await ctx.reply("usage: `/cmd <gemini command>` — see gemini-cli's available commands (memory, extensions, init, restore, ...)")
+      await ctx.reply("usage: `/cmd <gemini command>` — e.g. `/cmd memory show`, `/cmd init`, `/cmd restore list`")
+      return
+    }
+    // gemini's prompt handler intercepts text starting with '/' or '$'
+    // and routes it through its internal command dispatcher. So we send
+    // the command as a regular prompt with the leading slash preserved.
+    try {
+      const text = args.startsWith('/') ? args : `/${args}`
+      await gemini.sessionPrompt(sid, text)
+      // No explicit reply here — gemini will stream the command output
+      // back via the normal session/update channel.
+    } catch (err) {
+      await ctx.reply(`prompt-as-command failed: ${(err as Error).message}`)
+    }
+  })
+
+  slash.register('fork', '<sessionId>', 'fork an existing gemini session into a parallel branch (current chat → fork)', async (args, ctx) => {
+    if (!args) {
+      await ctx.reply('usage: `/fork <sessionId>`')
       return
     }
     try {
-      const result = await gemini.sessionHandleCommand(sid, args)
-      await ctx.reply(`🔧 \`${args}\` → ${JSON.stringify(result).slice(0, 1500)}`)
+      const r = await gemini.sessionFork(args, DEFAULT_CWD)
+      await sessionMap.set(ctx.chatId, r.sessionId)
+      sessionToChat.set(r.sessionId, ctx.chatId)
+      await ctx.reply(`🌿 forked → \`${r.sessionId}\` — next message uses this branch.`)
     } catch (err) {
-      await ctx.reply(`handle_command failed: ${(err as Error).message}`)
+      await ctx.reply(`fork failed: ${(err as Error).message}`)
     }
   })
 

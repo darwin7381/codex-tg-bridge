@@ -356,4 +356,16 @@ export class CodexClient extends EventEmitter {
   turnInterrupt(threadId: string, turnId: string): Promise<unknown> {
     return this.send('turn/interrupt', { threadId, turnId })
   }
+
+  /**
+   * List recent threads. Codex's app-server keeps thread metadata
+   * (title, last activity) so we can surface a `/list` slash command
+   * that's actually useful — not just opaque UUIDs.
+   *
+   * The exact response shape isn't strongly typed yet; calling code
+   * should treat the result as best-effort.
+   */
+  threadList(params: { limit?: number; sortBy?: string } = {}): Promise<unknown> {
+    return this.send('thread/list', params)
+  }
 }

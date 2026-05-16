@@ -291,12 +291,10 @@ export class GeminiClient extends EventEmitter {
 
   /**
    * Switch the session into one of the agent's modes. Discovered method
-   * names from gemini-cli's acpClient.js: `session/set_mode` returns
-   * `{ available_modes }` or similar; the active mode is then
-   * referenced on subsequent prompt turns.
-   *
-   * Gemini exposes: default | autoEdit | yolo | plan (see the
-   * `modes.availableModes` array on session/new response).
+   * names from gemini-cli's acpClient.js + @agentclientprotocol/sdk
+   * wire schema: `session/set_mode`. Gemini exposes:
+   *   default | autoEdit | yolo | plan
+   * (see `modes.availableModes` on the session/new response).
    */
   sessionSetMode(sessionId: string, modeId: string): Promise<unknown> {
     return this.send('session/set_mode', { sessionId, modeId })
@@ -312,14 +310,40 @@ export class GeminiClient extends EventEmitter {
   }
 
   /**
-   * Invoke one of the agent's slash commands directly. Examples from
-   * the `available_commands_update` notification:
-   *   `memory show` / `memory list` / `memory add <text>`
-   *   `extensions list` / `extensions enable <name>`
-   *   `init` (analyzes project, writes GEMINI.md)
-   *   `restore` / `restore list` (checkpoint system)
+   * List previous sessions. Per ACP schema:
+   *   request: { cwd?, cursor? }
+   *   response: { sessions: SessionInfo[], nextCursor? }
+   *   SessionInfo = { sessionId, cwd, title?, updatedAt? }
+   *
+   * Used by the bridge's `/list` slash command so users can pick a
+   * specific session to resume by id (or by title prefix).
    */
-  sessionHandleCommand(sessionId: string, command: string): Promise<unknown> {
-    return this.send('session/handle_command', { sessionId, command })
+  sessionList(cwd?: string, cursor?: string): Promise<{
+    sessions: Array<{ sessionId: string; cwd: string; title?: string | null; updatedAt?: string | null }>
+    nextCursor?: string | null
+  }> {
+    const params: Record<string, unknown> = {}
+    if (cwd) params.cwd = cwd
+    if (cursor) params.cursor = cursor
+    return this.send('session/list', params)
+  }
+
+  /** Fork an existing session into a parallel branch. */
+  sessionFork(sessionId: string, cwd?: string): Promise<NewSessionResponse> {
+    const params: Record<string, unknown> = { sessionId, mcpServers: [] }
+    if (cwd) params.cwd = cwd
+    return this.send<NewSessionResponse>('session/fork', params)
+  }
+
+  /**
+   * Resume a session (ACP's experimental method — different from
+   * session/load which loads from disk). The two appear interchangeable
+   * in current gemini-cli; we try session/load first via sessionLoad()
+   * and fall back to this if the agent supports session/resume only.
+   */
+  sessionResume(sessionId: string, cwd?: string): Promise<NewSessionResponse> {
+    const params: Record<string, unknown> = { sessionId, mcpServers: [] }
+    if (cwd) params.cwd = cwd
+    return this.send<NewSessionResponse>('session/resume', params)
   }
 }
