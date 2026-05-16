@@ -33,6 +33,7 @@ import { formatItem } from './item-formatter.ts'
 import { TurnStreamConsumer } from './turn-stream-consumer.ts'
 import { ApprovalTracker, type ApprovalType } from './approval-tracker.ts'
 import { attachmentsToCodexInput } from './attachment-to-input.ts'
+import { SlashCommandRouter } from './slash-commands.ts'
 import { config as loadDotenv } from 'dotenv'
 import { existsSync } from 'node:fs'
 import { randomBytes } from 'node:crypto'
@@ -431,9 +432,90 @@ async function main(): Promise<void> {
     }
   })
 
+  // --- slash command router ----------------------------------------------
+  // Bridge-managed commands run before the message is forwarded to codex
+  // as a prompt. Codex doesn't expose set_mode / set_model RPCs the way
+  // gemini does — those settings live in ~/.codex/config.toml — so the
+  // codex side only carries the universal bridge commands.
+  const slash = new SlashCommandRouter()
+
+  slash.register('new', '', 'drop the saved thread and start fresh on the next message', async (_args, ctx) => {
+    await sessionMap.clear(ctx.chatId)
+    await ctx.reply('🆕 next message will start a fresh thread.')
+  })
+
+  slash.register('list', '', 'list recent codex threads (id + title + last activity)', async (_args, ctx) => {
+    const cur = sessionMap.get(ctx.chatId)
+    const lines = [`current thread: \`${cur ?? '(none)'}\``, '']
+    try {
+      const result = (await codex.threadList({ limit: 15 })) as any
+      const threads: any[] = result?.threads ?? result?.items ?? result?.data ?? []
+      if (!Array.isArray(threads) || threads.length === 0) {
+        lines.push('(codex returned no threads)')
+      } else {
+        lines.push(`codex threads (${threads.length}):`)
+        for (const t of threads.slice(0, 15)) {
+          const id = String(t.id ?? t.threadId ?? '?')
+          const tag = id === cur ? ' ← current' : ''
+          const updated =
+            t.updatedAt ?? t.updated_at ?? t.lastActivityAt ?? t.last_activity_at ?? '?'
+          const title = t.title ?? t.name ?? t.preview ?? '(untitled)'
+          lines.push(`• \`${id.slice(0, 8)}…\` ${String(updated).slice(0, 16)}  ${title}${tag}`)
+        }
+        lines.push('', 'use `/resume <full-id>` to switch.')
+      }
+    } catch (err) {
+      lines.push(
+        `(thread/list failed: ${(err as Error).message})`,
+        '',
+        'fallback — local rollouts:',
+      )
+      // (We could shell out to `find ~/.codex/sessions` here but keep
+      // it simple: the user can always /list via gemini-side anyway.)
+    }
+    await ctx.reply(lines.join('\n'))
+  })
+
+  slash.register('resume', '<threadId>', 'switch this chat to a different stored thread', async (args, ctx) => {
+    if (!args) {
+      await ctx.reply('usage: `/resume <threadId>` — see `/list` for ids.')
+      return
+    }
+    await sessionMap.set(ctx.chatId, args)
+    await ctx.reply(`✅ resumed thread \`${args}\` — next message attempts thread/resume.`)
+  })
+
+  slash.register('cancel', '', 'interrupt the currently running turn', async (_args, ctx) => {
+    // Find any active turn for this chat in turnIdByCancelRef.
+    for (const [ref, info] of turnIdByCancelRef.entries()) {
+      const cId = threadToChat.get(info.threadId)
+      if (cId === ctx.chatId) {
+        turnIdByCancelRef.delete(ref)
+        try {
+          await codex.turnInterrupt(info.threadId, info.turnId)
+          await ctx.reply('⛔ cancel requested.')
+        } catch (err) {
+          await ctx.reply(`cancel failed: ${(err as Error).message}`)
+        }
+        return
+      }
+    }
+    await ctx.reply('no active turn for this chat.')
+  })
+
   // --- inbound TG → codex ------------------------------------------------
   tg.on('message', async (m: InboundMessage) => {
     log('info', `→ TG msg from chat=${m.chatId} user=${m.username}: ${m.text.slice(0, 80)}`)
+
+    // Bridge-managed slash commands — dispatched before any codex prompt.
+    if (m.text && m.text.trim().startsWith('/') && m.attachments.length === 0) {
+      const handled = await slash.dispatch(m.text, {
+        chatId: m.chatId,
+        reply: (t: string) => tg.reply(m.chatId, t, m.messageId),
+        log,
+      })
+      if (handled) return
+    }
 
     let threadId = sessionMap.get(m.chatId)
 
