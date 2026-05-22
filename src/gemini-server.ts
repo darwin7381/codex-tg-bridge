@@ -188,6 +188,24 @@ async function main(): Promise<void> {
   const turnAlertSent = new Set<string>()             // sessionId already warned this turn
   const TOOL_CALL_ALERT_THRESHOLD = 10
 
+  // 2026-05-23 — Per-chat verbosity (Joey 2026-05-22):
+  //   quiet   = hide thought_chunks (default; less noise)
+  //             also suppress tool_call_update lines that carry no content
+  //   normal  = same as quiet (kept as separate level for future)
+  //   verbose = relay thought_chunks truncated (~100 chars dim) so user can
+  //             see what gemini is reasoning about live
+  // Toggle via /verbosity <quiet|normal|verbose>. In-memory only; resets
+  // on bridge restart back to 'normal'.
+  type Verbosity = 'quiet' | 'normal' | 'verbose'
+  const chatVerbosity = new Map<string, Verbosity>() // chatId → level
+  const getVerbosity = (cid: string): Verbosity => chatVerbosity.get(cid) ?? 'normal'
+
+  // Throttle thought_chunk relays so a flood of small chunks doesn't
+  // produce 50 TG messages per turn. We coalesce thoughts within a
+  // 1500ms window per chat into one summary message.
+  type ThoughtBuf = { text: string; timer: ReturnType<typeof setTimeout> | null }
+  const thoughtBuffers = new Map<string, ThoughtBuf>() // chatId → buffered chunks
+
   // --- ACP approvals: server-provided options ---------------------------
   // ApprovalTracker's "decision" string fits ACP optionId fine; we just
   // pass through whatever the agent offered. No enum validation —
@@ -354,18 +372,43 @@ async function main(): Promise<void> {
     const kind = update.sessionUpdate
 
     if (kind === 'agent_message_chunk' || kind === 'agent_thought_chunk') {
-      // Streaming text. agent_thought_chunk is reasoning we hide;
+      // Streaming text. agent_thought_chunk is reasoning;
       // agent_message_chunk is the user-facing reply.
-      if (kind !== 'agent_message_chunk') return
       const raw: string =
         (typeof update.content?.text === 'string' && update.content.text) ||
         (typeof update.content === 'string' && update.content) ||
         ''
       const text = sanitizeForTg(raw)
       if (!text) return
-      // Text appeared — reset tool-loop alert state for this turn.
+
+      if (kind === 'agent_thought_chunk') {
+        // Relay only in 'verbose' mode. Coalesce chunks within 1500ms so
+        // we send ONE digest message per burst of thinking, not 30.
+        if (getVerbosity(chatId) !== 'verbose') return
+        const existing = thoughtBuffers.get(chatId)
+        const combined = (existing?.text ?? '') + text
+        if (existing?.timer) clearTimeout(existing.timer)
+        const timer = setTimeout(() => {
+          const buf = thoughtBuffers.get(chatId)
+          if (!buf) return
+          thoughtBuffers.delete(chatId)
+          // Truncate to ~250 chars; collapse whitespace for dense display.
+          const dense = buf.text.replace(/\s+/g, ' ').trim()
+          const preview = dense.length > 250 ? dense.slice(0, 250) + '…' : dense
+          if (!preview) return
+          tg.reply(chatId, `🤔 _${preview}_`).catch(err =>
+            log('warn', `thought relay failed: ${(err as Error).message}`),
+          )
+        }, 1500)
+        thoughtBuffers.set(chatId, { text: combined, timer })
+        return
+      }
+
+      // agent_message_chunk — text appeared, reset tool-loop alert + flush thoughts.
       turnToolCallCount.set(sessionId, 0)
       turnAlertSent.delete(sessionId)
+      const tbuf = thoughtBuffers.get(chatId)
+      if (tbuf?.timer) { clearTimeout(tbuf.timer); thoughtBuffers.delete(chatId) }
       let consumer = turnConsumers.get(sessionId)
       if (!consumer) {
         consumer = new TurnStreamConsumer(tg, chatId, log)
@@ -620,6 +663,31 @@ async function main(): Promise<void> {
       await ctx.reply(`cancel failed: ${(err as Error).message}`)
     }
   })
+
+  slash.register(
+    'verbosity',
+    '<quiet|normal|verbose>',
+    "set per-chat reply verbosity. verbose = relay gemini's chain-of-thought (truncated, dim italics, coalesced 1.5s); normal/quiet = hide thoughts (current default)",
+    async (args, ctx) => {
+      const norm = args.trim().toLowerCase() as Verbosity | ''
+      if (!norm) {
+        const cur = getVerbosity(ctx.chatId)
+        await ctx.reply(`current: \`${cur}\`. usage: \`/verbosity <quiet|normal|verbose>\``)
+        return
+      }
+      if (norm !== 'quiet' && norm !== 'normal' && norm !== 'verbose') {
+        await ctx.reply(`unknown level \`${norm}\`. options: quiet | normal | verbose`)
+        return
+      }
+      chatVerbosity.set(ctx.chatId, norm)
+      const desc = {
+        quiet:   '🤫 quiet — hide thoughts + tool_call_update without content (default minus)',
+        normal:  '🗣 normal — hide thoughts (default)',
+        verbose: '🧠 verbose — relay thoughts truncated dim (1.5s coalesced)',
+      }[norm]
+      await ctx.reply(desc)
+    },
+  )
 
   slash.register('autoapprove', '<on|off>', 'toggle bridge auto-approve for this session', async (args, ctx) => {
     const sid = sessionMap.get(ctx.chatId)

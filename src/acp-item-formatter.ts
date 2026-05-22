@@ -164,17 +164,30 @@ export function formatAcpUpdate(update: AcpUpdate): string | null {
     }
 
     case 'tool_call_update': {
-      // Surface terminal states (completed / failed); skip in_progress
-      // updates to keep the chat un-noisy.
+      // Surface tool completion ONLY when it carries useful new info
+      // (output content or a failure). A bare "completed" line for the
+      // already-shown tool_call adds no signal — it just doubles the
+      // message count. (Joey 2026-05-22: the screen filled with
+      // identical "✔ tool run_shel completed" — that's the toolCallId
+      // prefix sliced to 8 chars, not the tool name; meaningless.)
       const u = update as any
       const status = u.status
-      if (status !== 'completed' && status !== 'failed') return null
-      const id = u.toolCallId?.slice(0, 8) ?? '?'
-      const emoji = status === 'completed' ? '✔' : '❌'
-      let body = `${emoji} tool ${id} ${status}`
-      const preview = renderToolContent(u.content)
-      if (preview) body += `\n${preview}`
-      return truncate(body)
+      // Errors / failures: always show — user needs to know the tool died.
+      if (status === 'failed') {
+        const preview = renderToolContent(u.content)
+        const title = u.title ? sanitizeForTg(u.title) : `id=${u.toolCallId?.slice(0, 8) ?? '?'}`
+        return truncate(`❌ failed: ${title}${preview ? `\n${preview}` : ''}`)
+      }
+      // Successes: surface ONLY if there's actual content to show
+      // (command output, file diff, etc). Bare completion = drop it.
+      if (status === 'completed') {
+        const preview = renderToolContent(u.content)
+        if (!preview) return null  // no new info → suppress (was the spam source)
+        const title = u.title ? sanitizeForTg(u.title) : `id=${u.toolCallId?.slice(0, 8) ?? '?'}`
+        return truncate(`✔ ${title}\n${preview}`)
+      }
+      // in_progress and others — skip.
+      return null
     }
 
     case 'available_commands_update':
