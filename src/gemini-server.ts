@@ -362,6 +362,29 @@ async function main(): Promise<void> {
       return
     }
 
+    // 2026-05-22 — During sessionLoad replay (gemini re-emits historical
+    // conversation events including every past tool_call), suppress
+    // tool_call / tool_call_update because the user doesn't want to see
+    // "👀 read: ReadFile / 🔍 search: SearchText" walls for past
+    // internal warm-up. During a LIVE turn (we have an activeTurnPromise
+    // for this session) we keep them — tool calls during normal
+    // conversation ARE useful. write_todos and plan stay visible in
+    // both modes because they're high-signal.
+    const isReplay = !activeTurnPromises.has(sessionId)
+    if (
+      isReplay &&
+      (kind === 'tool_call' || kind === 'tool_call_update')
+    ) {
+      const u = update as any
+      const isWriteTodos =
+        (u.title && /todo/i.test(u.title)) ||
+        (u.rawInput && Array.isArray(u.rawInput.todos))
+      if (!isWriteTodos) {
+        log('info', `suppressing replay ${kind} title=${u.title ?? '?'}`)
+        return
+      }
+    }
+
     // Tool calls / plan / etc. — render via formatter, send as separate
     // TG messages.
     const rendered = formatAcpUpdate(update)
