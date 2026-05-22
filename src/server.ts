@@ -114,6 +114,16 @@ async function main(): Promise<void> {
   // allows it).
   const streamConsumers = new Map<string, TurnStreamConsumer>()
 
+  // 2026-05-23 — Tool-loop alert. Mirror of gemini-server.ts logic.
+  // Counts non-agentMessage items per turn; resets on agentMessage; warns
+  // once per turn at threshold suggesting /cancel. Most "tool-like" item
+  // types we care about: localShellCall / functionCall / fileChange /
+  // reasoning. We count everything that isn't agentMessage as a "tool
+  // event" — simpler and tracks model decision count.
+  const turnToolCallCount = new Map<string, number>() // turnId → count
+  const turnAlertSent = new Set<string>()             // turnId already warned this turn
+  const TOOL_CALL_ALERT_THRESHOLD = 10
+
   codex.on('notification', (method: string, params: any) => {
     log('info', `← codex: ${method} ${params?.threadId ? `thread=${params.threadId.slice(0, 8)}` : ''}${params?.turnId ? ` turn=${params.turnId.slice(0, 8)}` : ''}${params?.item?.type ? ` item.type=${params.item.type}` : ''}`)
   })
@@ -261,6 +271,11 @@ async function main(): Promise<void> {
     // delta drift with the polished version, then let the consumer
     // close out its message.
     if (item.type === 'agentMessage') {
+      // Text appeared — reset tool-loop alert state for this turn.
+      if (p.turnId) {
+        turnToolCallCount.set(p.turnId, 0)
+        turnAlertSent.delete(p.turnId)
+      }
       const consumer = streamConsumers.get(item.id)
       if (consumer) {
         consumer.finish(typeof item.text === 'string' ? item.text : undefined)
@@ -278,6 +293,25 @@ async function main(): Promise<void> {
         }
       }
       return
+    }
+
+    // Tool-loop alert: count non-agentMessage items per turn. At
+    // threshold, fire one TG warning suggesting /cancel.
+    if (p.turnId) {
+      const n = (turnToolCallCount.get(p.turnId) ?? 0) + 1
+      turnToolCallCount.set(p.turnId, n)
+      if (n === TOOL_CALL_ALERT_THRESHOLD && !turnAlertSent.has(p.turnId)) {
+        turnAlertSent.add(p.turnId)
+        log('warn', `tool-loop alert: turn=${p.turnId.slice(0, 8)} hit ${n} non-text items with no agentMessage`)
+        try {
+          await tg.reply(
+            chatId,
+            `⚠️ codex has produced ${n} items (tools / reasoning / etc.) without emitting a text reply — may be stuck in a tool loop.\nTap ⛔ Stop above or send /cancel to interrupt.`,
+          )
+        } catch (err) {
+          log('warn', `tool-loop alert TG reply failed: ${(err as Error).message}`)
+        }
+      }
     }
 
     // Tool-call / reasoning / plan / file-change items: render via
@@ -400,6 +434,9 @@ async function main(): Promise<void> {
   codex.on('method:turn/completed', async (p: any) => {
     const { turn } = p as { threadId: string; turn: { turnId: string } }
     turnToChat.delete(turn.turnId)
+    // Reset tool-loop alert state for this turn.
+    turnToolCallCount.delete(turn.turnId)
+    turnAlertSent.delete(turn.turnId)
     // Remove stop button (edit message in place).
     const stop = stopMessageByTurn.get(turn.turnId)
     if (stop) {
