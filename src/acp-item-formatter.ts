@@ -111,6 +111,26 @@ export function formatAcpUpdate(update: AcpUpdate): string | null {
       // Quiet to avoid pane spam; agents stream these constantly.
       return null
 
+    case 'user_message_chunk': {
+      // Emitted during sessionLoad replay (gemini re-streams the
+      // conversation history). Each historical user-side message arrives
+      // as one chunk. Render compactly so the user can see their past
+      // messages without the raw-JSON dump that the default case would
+      // produce. The default case fell through to a JSON dump because
+      // this kind wasn't handled — that produced the ugly
+      // `(session/update kind=user_message_chunk) {...}` lines that
+      // Joey called out 2026-05-22.
+      const content = (update as any).content
+      const text =
+        content && typeof content === 'object' && typeof content.text === 'string'
+          ? content.text
+          : typeof content === 'string'
+            ? content
+            : ''
+      if (!text) return null
+      return truncate(`👤 ${sanitizeForTg(text).replace(/\n/g, ' ')}`, 800)
+    }
+
     case 'plan': {
       const entries = (update as any).entries as Array<{ content: string; status?: string }> | undefined
       if (!Array.isArray(entries) || entries.length === 0) return null
