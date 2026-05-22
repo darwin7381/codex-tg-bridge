@@ -173,6 +173,29 @@ export class TelegramClient extends EventEmitter {
     await this.bot.stop()
   }
 
+  /**
+   * Register the bot's slash-command suggestions with Telegram so the
+   * native client pops up an autocomplete menu when the user types `/`.
+   * Without this, the SlashCommandRouter still works (typing the full
+   * command and sending dispatches it), but there is no UI hint.
+   *
+   * Bot API: https://core.telegram.org/bots/api#setmycommands
+   */
+  async setMyCommands(
+    commands: ReadonlyArray<{ command: string; description: string }>,
+  ): Promise<void> {
+    // Telegram caps the list at 100 and requires each command match
+    // /^[a-z0-9_]{1,32}$/. The caller already filters, but be defensive.
+    const filtered = commands
+      .filter(c => /^[a-z0-9_]{1,32}$/.test(c.command))
+      .map(c => ({
+        command: c.command,
+        description: (c.description || '(no description)').slice(0, 256),
+      }))
+      .slice(0, 100)
+    await this.bot.api.setMyCommands(filtered)
+  }
+
   // --- inbound handlers ---------------------------------------------------
 
   private async safeHandle(ctx: Context, attachments: Attachment[]): Promise<void> {
