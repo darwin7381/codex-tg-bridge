@@ -180,6 +180,17 @@ export class TelegramClient extends EventEmitter {
    * command and sending dispatches it), but there is no UI hint.
    *
    * Bot API: https://core.telegram.org/bots/api#setmycommands
+   *
+   * Registers to TWO scopes:
+   *   - default (catches anywhere a more specific scope isn't set)
+   *   - all_private_chats (overrides any BotFather-era leftover commands
+   *     that would otherwise be shown in private DMs)
+   *
+   * Without the all_private_chats override, a bot that had BotFather
+   * placeholder commands set (e.g. /start /help /status) would show
+   * THOSE in private chats instead of ours — even though our default-
+   * scope registration is valid. Telegram client picks the most-specific
+   * scope first per https://core.telegram.org/bots/api#botcommandscope.
    */
   async setMyCommands(
     commands: ReadonlyArray<{ command: string; description: string }>,
@@ -193,7 +204,12 @@ export class TelegramClient extends EventEmitter {
         description: (c.description || '(no description)').slice(0, 256),
       }))
       .slice(0, 100)
+    // Default scope — catches anywhere no more specific scope is set.
     await this.bot.api.setMyCommands(filtered)
+    // all_private_chats scope — overrides BotFather-era leftover commands
+    // in DMs. Same command list; just makes sure private-chat clients
+    // pick up our list instead of any older configuration.
+    await this.bot.api.setMyCommands(filtered, { scope: { type: 'all_private_chats' } })
   }
 
   // --- inbound handlers ---------------------------------------------------
