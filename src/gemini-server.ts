@@ -177,6 +177,17 @@ async function main(): Promise<void> {
   const turnConsumers = new Map<string, TurnStreamConsumer>() // sessionId → consumer
   const activeTurnPromises = new Map<string, Promise<unknown>>()
 
+  // 2026-05-23 — Tool-call loop alert (Joey 2026-05-22 observation).
+  // Gemini occasionally enters "self-investigation" mode where it chains
+  // many shell tool calls + thought chunks without ever emitting an
+  // agent_message_chunk → user sees only "execute: ..." spam, no text
+  // reply. Counter increments on tool_call during a live turn, resets on
+  // agent_message_chunk or turn end. Hitting threshold fires a one-time
+  // warning per turn suggesting /cancel.
+  const turnToolCallCount = new Map<string, number>() // sessionId → count
+  const turnAlertSent = new Set<string>()             // sessionId already warned this turn
+  const TOOL_CALL_ALERT_THRESHOLD = 10
+
   // --- ACP approvals: server-provided options ---------------------------
   // ApprovalTracker's "decision" string fits ACP optionId fine; we just
   // pass through whatever the agent offered. No enum validation —
@@ -352,6 +363,9 @@ async function main(): Promise<void> {
         ''
       const text = sanitizeForTg(raw)
       if (!text) return
+      // Text appeared — reset tool-loop alert state for this turn.
+      turnToolCallCount.set(sessionId, 0)
+      turnAlertSent.delete(sessionId)
       let consumer = turnConsumers.get(sessionId)
       if (!consumer) {
         consumer = new TurnStreamConsumer(tg, chatId, log)
@@ -382,6 +396,27 @@ async function main(): Promise<void> {
       if (!isWriteTodos) {
         log('info', `suppressing replay ${kind} title=${u.title ?? '?'}`)
         return
+      }
+    }
+
+    // Tool-loop alert: count live tool_call (not tool_call_update — those
+    // are status updates for an already-counted call). At threshold, fire
+    // one TG warning suggesting /cancel. Reset is handled by
+    // agent_message_chunk above and at turn end below.
+    if (kind === 'tool_call' && !isReplay) {
+      const n = (turnToolCallCount.get(sessionId) ?? 0) + 1
+      turnToolCallCount.set(sessionId, n)
+      if (n === TOOL_CALL_ALERT_THRESHOLD && !turnAlertSent.has(sessionId)) {
+        turnAlertSent.add(sessionId)
+        log('warn', `tool-loop alert: session=${sessionId.slice(0, 8)} hit ${n} tool calls with no agent_message_chunk`)
+        try {
+          await tg.reply(
+            chatId,
+            `⚠️ gemini has run ${n} tool calls without emitting a text reply — may be stuck in a self-investigation loop.\nTap ⛔ Stop above or send /cancel to interrupt.`,
+          )
+        } catch (err) {
+          log('warn', `tool-loop alert TG reply failed: ${(err as Error).message}`)
+        }
       }
     }
 
@@ -825,6 +860,9 @@ async function main(): Promise<void> {
       }
 
       activeTurnPromises.delete(sessionId)
+      // Reset tool-loop alert state for the next turn.
+      turnToolCallCount.delete(sessionId)
+      turnAlertSent.delete(sessionId)
       log('info', `session/prompt complete chat=${m.chatId} stopReason=${response?.stopReason ?? '?'}`)
       // Remove the cancel ref + tidy the Stop message.
       cancelRefToSession.delete(cancelRef)
@@ -845,6 +883,8 @@ async function main(): Promise<void> {
     } catch (err) {
       log('error', `session/prompt failed: ${(err as Error).message}`)
       activeTurnPromises.delete(sessionId)
+      turnToolCallCount.delete(sessionId)
+      turnAlertSent.delete(sessionId)
       cancelRefToSession.delete(cancelRef)
       const stop = stopMessageBySession.get(sessionId)
       if (stop) {
