@@ -512,8 +512,8 @@ async function main(): Promise<void> {
     await resumeByRef(a, ctx)
   })
 
-  slash.register('resume_last', '', 'switch to the most recent thread (= /resume 1 after /list)', async (_args, ctx) => {
-    // Auto-populate the list cache if it's not there, then resume 1.
+  slash.register('resume_last', '', 'switch to the most recent codex thread that you are NOT currently in', async (_args, ctx) => {
+    // Auto-populate the list cache if it's not there.
     if (!lastListByChat.has(ctx.chatId) || (lastListByChat.get(ctx.chatId)?.length ?? 0) === 0) {
       await listThreadsHandler('', { ...ctx, reply: async () => {} })
     }
@@ -522,7 +522,18 @@ async function main(): Promise<void> {
       await ctx.reply('no recent thread found.')
       return
     }
-    await resumeByRef('1', ctx)
+    // Skip the thread we're already in — common case is user opened
+    // /new, exchanged nothing, and wants to go BACK to their previous
+    // conversation. The fresh empty thread is now sorted as the most
+    // recent, but resuming TO it from itself is a no-op the user didn't
+    // want.
+    const cur = sessionMap.get(ctx.chatId)
+    const target = ids.find(id => id !== cur)
+    if (!target) {
+      await ctx.reply('only one thread exists (or you are already in the most recent one). nothing to switch to — try `/list` to pick a specific one or `/new` to start fresh.')
+      return
+    }
+    await resumeByRef(target, ctx)
   })
 
   slash.register('cancel', '', 'interrupt the currently running turn', async (_args, ctx) => {

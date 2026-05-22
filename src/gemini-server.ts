@@ -528,7 +528,7 @@ async function main(): Promise<void> {
     await resumeByRef(a, ctx)
   })
 
-  slash.register('resume_last', '', 'switch to the most recent gemini session (= /resume 1 after /list)', async (_args, ctx) => {
+  slash.register('resume_last', '', 'switch to the most recent gemini session that you are NOT currently in', async (_args, ctx) => {
     // Auto-refresh cache first; cheap (just reads disk).
     const entries = listGeminiSessionsFromDisk(DEFAULT_CWD, 15)
     if (entries.length === 0) {
@@ -536,7 +536,17 @@ async function main(): Promise<void> {
       return
     }
     lastListByChat.set(ctx.chatId, entries.map(e => e.sessionId))
-    await resumeByRef('1', ctx)
+    // Skip the session we're already in — common case is user opened
+    // /new, exchanged nothing, and wants to go BACK to their previous
+    // conversation. mtime-DESC would otherwise return the just-opened
+    // empty one (it's now the newest) and /resume_last would be a no-op.
+    const cur = sessionMap.get(ctx.chatId)
+    const target = entries.find(e => e.sessionId !== cur)
+    if (!target) {
+      await ctx.reply('only one session exists (or you are already in the most recent one). nothing to switch to — try `/list` to pick a specific one or `/new` to start fresh.')
+      return
+    }
+    await resumeByRef(target.sessionId, ctx)
   })
 
   slash.register('cancel', '', 'interrupt the currently running turn', async (_args, ctx) => {
