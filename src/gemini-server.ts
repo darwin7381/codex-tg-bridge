@@ -462,7 +462,11 @@ async function main(): Promise<void> {
     await ctx.reply('🆕 next message will start a fresh session.')
   })
 
-  slash.register('list', '', 'list recent gemini sessions (with title + last activity)', async (_args, ctx) => {
+  // Remember the most recent /list ordering per chat so /resume <number>
+  // can resolve a numeric index without copy-pasting a UUID.
+  const lastListByChat = new Map<string, string[]>()
+
+  async function listSessionsHandler(_args: string, ctx: any): Promise<void> {
     const cur = sessionMap.get(ctx.chatId)
     const lines = [`current session: \`${cur ?? '(none)'}\``, '']
     const entries = listGeminiSessionsFromDisk(DEFAULT_CWD, 15)
@@ -470,36 +474,69 @@ async function main(): Promise<void> {
       lines.push('(no persisted gemini sessions found for this project)')
     } else {
       lines.push(`gemini sessions (${entries.length} shown, newest first):`)
-      for (const s of entries) {
+      const ids: string[] = []
+      entries.forEach((s, i) => {
+        ids.push(s.sessionId)
         const tag = s.sessionId === cur ? ' ← current' : ''
         const updated = (s.lastUpdated ?? new Date(s.mtimeMs).toISOString()).slice(0, 16)
         const title = s.title ?? '(no user msg)'
-        lines.push(`• \`${s.sessionId}\`\n   ${updated}  ${title}${tag}`)
-      }
-      lines.push('', 'copy a full id and `/resume <sessionId>` to switch.')
+        lines.push(`${i + 1}. \`${s.sessionId.slice(0, 8)}…\` ${updated}  ${title}${tag}`)
+      })
+      lastListByChat.set(ctx.chatId, ids)
+      lines.push('', 'use `/resume <number>` (e.g. `/resume 2`), `/resume <full-sessionId>`, or `/resume_last`.')
     }
     await ctx.reply(lines.join('\n'))
-  })
+  }
 
-  slash.register('resume', '<sessionId>', 'switch this chat to a stored gemini session and reload its history', async (args, ctx) => {
-    const id = args.trim()
-    if (!id) {
-      await ctx.reply('usage: `/resume <sessionId>` — see `/list` for available ids.')
-      return
+  slash.register('list', '', 'list recent gemini sessions (numbered; use /resume <number> to switch)', listSessionsHandler)
+  // /sessions is a more-explicit alias people reach for, and avoids
+  // confusion with generic "list" if other tools also register one.
+  slash.register('sessions', '', 'alias of /list — show recent gemini sessions', listSessionsHandler)
+
+  async function resumeByRef(ref: string, ctx: any): Promise<void> {
+    let targetId = ref
+    if (/^\d+$/.test(ref)) {
+      const ids = lastListByChat.get(ctx.chatId)
+      if (!ids || ids.length === 0) {
+        await ctx.reply('no numbered list available yet — run `/list` first, then `/resume <number>`.')
+        return
+      }
+      const idx = parseInt(ref, 10) - 1
+      if (idx < 0 || idx >= ids.length) {
+        await ctx.reply(`number out of range — last /list had ${ids.length} entries.`)
+        return
+      }
+      targetId = ids[idx]
     }
-    // Validate eagerly via session/load so the user gets immediate
-    // feedback if the id is wrong (rather than discovering it on the
-    // next prompt). On success, remember the id and mark it loaded so
-    // the inbound-message path skips re-loading.
     try {
-      await gemini.sessionLoad(id, DEFAULT_CWD)
-      await sessionMap.set(ctx.chatId, id)
-      sessionToChat.set(id, ctx.chatId)
-      loadedSessions.add(id)
-      await ctx.reply(`✅ resumed \`${id}\` — gemini reloaded its message history; next prompt continues this thread.`)
+      await gemini.sessionLoad(targetId, DEFAULT_CWD)
+      await sessionMap.set(ctx.chatId, targetId)
+      sessionToChat.set(targetId, ctx.chatId)
+      loadedSessions.add(targetId)
+      await ctx.reply(`✅ resumed \`${targetId}\` — gemini reloaded its message history; next prompt continues this thread.`)
     } catch (err) {
       await ctx.reply(`resume failed: ${(err as Error).message}\n\nrun \`/list\` to see valid ids.`)
     }
+  }
+
+  slash.register('resume', '<number|sessionId>', 'switch to a stored gemini session (number from /list or full id)', async (args, ctx) => {
+    const a = args.trim()
+    if (!a) {
+      await ctx.reply('usage: `/resume <number>` (e.g. `/resume 2`), `/resume <sessionId>`, or `/resume_last`. Run `/list` first for the numbered list.')
+      return
+    }
+    await resumeByRef(a, ctx)
+  })
+
+  slash.register('resume_last', '', 'switch to the most recent gemini session (= /resume 1 after /list)', async (_args, ctx) => {
+    // Auto-refresh cache first; cheap (just reads disk).
+    const entries = listGeminiSessionsFromDisk(DEFAULT_CWD, 15)
+    if (entries.length === 0) {
+      await ctx.reply('no persisted gemini session found for this project.')
+      return
+    }
+    lastListByChat.set(ctx.chatId, entries.map(e => e.sessionId))
+    await resumeByRef('1', ctx)
   })
 
   slash.register('cancel', '', 'interrupt the currently running turn', async (_args, ctx) => {

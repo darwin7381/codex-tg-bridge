@@ -444,7 +444,12 @@ async function main(): Promise<void> {
     await ctx.reply('🆕 next message will start a fresh thread.')
   })
 
-  slash.register('list', '', 'list recent codex threads (id + title + last activity)', async (_args, ctx) => {
+  // Remember the most recent /list ordering per chat so /resume <number>
+  // can resolve a numeric index back to the full thread id without the
+  // user copy-pasting a UUID.
+  const lastListByChat = new Map<string, string[]>()
+
+  async function listThreadsHandler(_args: string, ctx: any): Promise<void> {
     const cur = sessionMap.get(ctx.chatId)
     const lines = [`current thread: \`${cur ?? '(none)'}\``, '']
     try {
@@ -454,35 +459,70 @@ async function main(): Promise<void> {
         lines.push('(codex returned no threads)')
       } else {
         lines.push(`codex threads (${threads.length}):`)
-        for (const t of threads.slice(0, 15)) {
+        const ids: string[] = []
+        threads.slice(0, 15).forEach((t, i) => {
           const id = String(t.id ?? t.threadId ?? '?')
+          ids.push(id)
           const tag = id === cur ? ' ← current' : ''
           const updated =
             t.updatedAt ?? t.updated_at ?? t.lastActivityAt ?? t.last_activity_at ?? '?'
           const title = t.title ?? t.name ?? t.preview ?? '(untitled)'
-          lines.push(`• \`${id.slice(0, 8)}…\` ${String(updated).slice(0, 16)}  ${title}${tag}`)
-        }
-        lines.push('', 'use `/resume <full-id>` to switch.')
+          lines.push(`${i + 1}. \`${id.slice(0, 8)}…\` ${String(updated).slice(0, 16)}  ${title}${tag}`)
+        })
+        lastListByChat.set(ctx.chatId, ids)
+        lines.push('', 'use `/resume <number>` (e.g. `/resume 2`), `/resume <full-id>`, or `/resume_last`.')
       }
     } catch (err) {
-      lines.push(
-        `(thread/list failed: ${(err as Error).message})`,
-        '',
-        'fallback — local rollouts:',
-      )
-      // (We could shell out to `find ~/.codex/sessions` here but keep
-      // it simple: the user can always /list via gemini-side anyway.)
+      lines.push(`(thread/list failed: ${(err as Error).message})`)
     }
     await ctx.reply(lines.join('\n'))
-  })
+  }
 
-  slash.register('resume', '<threadId>', 'switch this chat to a different stored thread', async (args, ctx) => {
-    if (!args) {
-      await ctx.reply('usage: `/resume <threadId>` — see `/list` for ids.')
+  slash.register('list', '', 'list recent codex threads (numbered; use /resume <number> to switch)', listThreadsHandler)
+  // /sessions is a more-explicit alias people reach for ("show my sessions")
+  // and avoids confusion with generic "list" if other bridges are added.
+  slash.register('sessions', '', 'alias of /list — show recent codex threads', listThreadsHandler)
+
+  async function resumeByRef(ref: string, ctx: any): Promise<void> {
+    let targetId = ref
+    // Resolve numeric short-cut against last /list ordering.
+    if (/^\d+$/.test(ref)) {
+      const ids = lastListByChat.get(ctx.chatId)
+      if (!ids || ids.length === 0) {
+        await ctx.reply('no numbered list available yet — run `/list` first, then `/resume <number>`.')
+        return
+      }
+      const idx = parseInt(ref, 10) - 1
+      if (idx < 0 || idx >= ids.length) {
+        await ctx.reply(`number out of range — last /list had ${ids.length} entries.`)
+        return
+      }
+      targetId = ids[idx]
+    }
+    await sessionMap.set(ctx.chatId, targetId)
+    await ctx.reply(`✅ resumed thread \`${targetId}\` — next message attempts thread/resume.`)
+  }
+
+  slash.register('resume', '<number|threadId>', 'switch this chat to a stored thread (number from /list or full id)', async (args, ctx) => {
+    const a = args.trim()
+    if (!a) {
+      await ctx.reply('usage: `/resume <number>` (e.g. `/resume 2`), `/resume <threadId>`, or `/resume_last`. Run `/list` first for the numbered list.')
       return
     }
-    await sessionMap.set(ctx.chatId, args)
-    await ctx.reply(`✅ resumed thread \`${args}\` — next message attempts thread/resume.`)
+    await resumeByRef(a, ctx)
+  })
+
+  slash.register('resume_last', '', 'switch to the most recent thread (= /resume 1 after /list)', async (_args, ctx) => {
+    // Auto-populate the list cache if it's not there, then resume 1.
+    if (!lastListByChat.has(ctx.chatId) || (lastListByChat.get(ctx.chatId)?.length ?? 0) === 0) {
+      await listThreadsHandler('', { ...ctx, reply: async () => {} })
+    }
+    const ids = lastListByChat.get(ctx.chatId)
+    if (!ids || ids.length === 0) {
+      await ctx.reply('no recent thread found.')
+      return
+    }
+    await resumeByRef('1', ctx)
   })
 
   slash.register('cancel', '', 'interrupt the currently running turn', async (_args, ctx) => {
