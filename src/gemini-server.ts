@@ -28,13 +28,89 @@ import { formatAcpUpdate, sanitizeForTg, extractGeneratedPaths } from './acp-ite
 import { attachmentsToAcpContent } from './attachment-to-input.ts'
 import { SlashCommandRouter } from './slash-commands.ts'
 import { config as loadDotenv } from 'dotenv'
-import { existsSync, readdirSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { join, basename } from 'node:path'
 import { randomBytes } from 'node:crypto'
 
 function loadStateDirEnv(stateDir: string): void {
   const envFile = `${stateDir}/.env`
   if (existsSync(envFile)) loadDotenv({ path: envFile, override: false })
+}
+
+/**
+ * Scan gemini-cli's persisted chats for the current project. ACP's
+ * `session/list` does not exist on gemini's wire (confirmed
+ * 2026-05-16 — returns -32601 Method not found). Sessions are
+ * persisted on disk at `~/.gemini/tmp/<basename(cwd)>/chats/session-*.json`.
+ *
+ * Each file's `sessionId` field is the canonical id that
+ * `session/load` accepts to restore message history.
+ */
+type DiskSession = {
+  sessionId: string
+  file: string
+  mtimeMs: number
+  lastUpdated?: string
+  title?: string
+}
+
+function listGeminiSessionsFromDisk(cwd?: string, limit = 20): DiskSession[] {
+  const projectDir = basename(cwd ?? process.cwd())
+  const chatsDir = join(
+    process.env.HOME ?? '',
+    '.gemini',
+    'tmp',
+    projectDir,
+    'chats',
+  )
+  if (!existsSync(chatsDir)) return []
+  const entries: DiskSession[] = []
+  for (const name of readdirSync(chatsDir)) {
+    if (!name.startsWith('session-') || !name.endsWith('.json')) continue
+    const full = join(chatsDir, name)
+    let mtimeMs = 0
+    try {
+      mtimeMs = statSync(full).mtimeMs
+    } catch {
+      continue
+    }
+    try {
+      const j = JSON.parse(readFileSync(full, 'utf8')) as {
+        sessionId?: string
+        lastUpdated?: string
+        messages?: Array<{ type?: string; content?: unknown }>
+      }
+      if (!j.sessionId) continue
+      // first user message → title preview
+      let title: string | undefined
+      for (const m of j.messages ?? []) {
+        if (m.type !== 'user') continue
+        const c = m.content
+        const text =
+          Array.isArray(c) && c[0] && typeof (c[0] as any).text === 'string'
+            ? (c[0] as any).text
+            : typeof c === 'string'
+              ? c
+              : ''
+        if (text) {
+          title = String(text).replace(/\s+/g, ' ').trim().slice(0, 60)
+          break
+        }
+      }
+      entries.push({
+        sessionId: j.sessionId,
+        file: name,
+        mtimeMs,
+        lastUpdated: j.lastUpdated,
+        title,
+      })
+    } catch {
+      // Skip malformed files (e.g. dump.txt, extract.js scratch files
+      // sitting in this dir from earlier debugging).
+    }
+  }
+  entries.sort((a, b) => b.mtimeMs - a.mtimeMs)
+  return entries.slice(0, limit)
 }
 
 const STATE_DIR =
@@ -326,6 +402,13 @@ async function main(): Promise<void> {
   // change.
   const autoApprove = new Set<string>()
 
+  // Tracks which sessionIds are known to be attached to the live
+  // gemini-cli subprocess. session/prompt with an id gemini doesn't
+  // know about throws "Session not found" → we have to call
+  // session/load(id, cwd) first. session/new auto-attaches; for
+  // restored ids from disk we need an explicit load.
+  const loadedSessions = new Set<string>()
+
   /** Pick the option most likely to mean "always allow". Heuristic over
    *  agent-supplied option names; falls back to first option. */
   function pickPermissiveOption(
@@ -382,59 +465,41 @@ async function main(): Promise<void> {
   slash.register('list', '', 'list recent gemini sessions (with title + last activity)', async (_args, ctx) => {
     const cur = sessionMap.get(ctx.chatId)
     const lines = [`current session: \`${cur ?? '(none)'}\``, '']
-    try {
-      const r = await gemini.sessionList(DEFAULT_CWD)
-      const top = r.sessions.slice(0, 15)
-      if (top.length === 0) {
-        lines.push('(no sessions returned by gemini)')
-      } else {
-        lines.push(`gemini sessions (${r.sessions.length} total, showing ${top.length}):`)
-        for (const s of top) {
-          const tag = s.sessionId === cur ? ' ← current' : ''
-          const updated = s.updatedAt ? new Date(s.updatedAt).toISOString().slice(0, 16) : '?'
-          const title = s.title ?? '(untitled)'
-          lines.push(`• \`${s.sessionId.slice(0, 8)}…\` ${updated}  ${title}${tag}`)
-        }
-        lines.push('', 'use `/resume <full-sessionId>` to switch.')
+    const entries = listGeminiSessionsFromDisk(DEFAULT_CWD, 15)
+    if (entries.length === 0) {
+      lines.push('(no persisted gemini sessions found for this project)')
+    } else {
+      lines.push(`gemini sessions (${entries.length} shown, newest first):`)
+      for (const s of entries) {
+        const tag = s.sessionId === cur ? ' ← current' : ''
+        const updated = (s.lastUpdated ?? new Date(s.mtimeMs).toISOString()).slice(0, 16)
+        const title = s.title ?? '(no user msg)'
+        lines.push(`• \`${s.sessionId}\`\n   ${updated}  ${title}${tag}`)
       }
-    } catch (err) {
-      lines.push(
-        `(session/list failed: ${(err as Error).message})`,
-        '',
-        'fallback — disk scan of ~/.gemini/tmp/codex-tg-bridge:',
-      )
-      try {
-        const tmpRoot = join(process.env.HOME ?? '', '.gemini', 'tmp', 'codex-tg-bridge')
-        const entries = readdirSync(tmpRoot)
-          .map(name => {
-            const p = join(tmpRoot, name)
-            try {
-              return { name, mtimeMs: statSync(p).mtimeMs }
-            } catch {
-              return null
-            }
-          })
-          .filter((x): x is { name: string; mtimeMs: number } => x !== null)
-          .sort((a, b) => b.mtimeMs - a.mtimeMs)
-          .slice(0, 10)
-        for (const e of entries) {
-          const tag = e.name === cur ? ' ← current' : ''
-          lines.push(`• \`${e.name}\` (mtime ${new Date(e.mtimeMs).toISOString().slice(0, 16)})${tag}`)
-        }
-      } catch {
-        lines.push('(disk scan also failed)')
-      }
+      lines.push('', 'copy a full id and `/resume <sessionId>` to switch.')
     }
     await ctx.reply(lines.join('\n'))
   })
 
-  slash.register('resume', '<sessionId>', 'switch this chat to a different stored session id', async (args, ctx) => {
-    if (!args) {
+  slash.register('resume', '<sessionId>', 'switch this chat to a stored gemini session and reload its history', async (args, ctx) => {
+    const id = args.trim()
+    if (!id) {
       await ctx.reply('usage: `/resume <sessionId>` — see `/list` for available ids.')
       return
     }
-    await sessionMap.set(ctx.chatId, args)
-    await ctx.reply(`✅ resumed session \`${args}\` — next message will attempt session/load.`)
+    // Validate eagerly via session/load so the user gets immediate
+    // feedback if the id is wrong (rather than discovering it on the
+    // next prompt). On success, remember the id and mark it loaded so
+    // the inbound-message path skips re-loading.
+    try {
+      await gemini.sessionLoad(id, DEFAULT_CWD)
+      await sessionMap.set(ctx.chatId, id)
+      sessionToChat.set(id, ctx.chatId)
+      loadedSessions.add(id)
+      await ctx.reply(`✅ resumed \`${id}\` — gemini reloaded its message history; next prompt continues this thread.`)
+    } catch (err) {
+      await ctx.reply(`resume failed: ${(err as Error).message}\n\nrun \`/list\` to see valid ids.`)
+    }
   })
 
   slash.register('cancel', '', 'interrupt the currently running turn', async (_args, ctx) => {
@@ -538,19 +603,16 @@ async function main(): Promise<void> {
     }
   })
 
-  slash.register('fork', '<sessionId>', 'fork an existing gemini session into a parallel branch (current chat → fork)', async (args, ctx) => {
-    if (!args) {
-      await ctx.reply('usage: `/fork <sessionId>`')
-      return
-    }
-    try {
-      const r = await gemini.sessionFork(args, DEFAULT_CWD)
-      await sessionMap.set(ctx.chatId, r.sessionId)
-      sessionToChat.set(r.sessionId, ctx.chatId)
-      await ctx.reply(`🌿 forked → \`${r.sessionId}\` — next message uses this branch.`)
-    } catch (err) {
-      await ctx.reply(`fork failed: ${(err as Error).message}`)
-    }
+  // Note: gemini-cli does NOT expose `session/fork` on its ACP wire
+  // (verified 2026-05-16 — returns -32601 Method not found). To get
+  // a parallel branch in gemini, the user has to run `/new` for a
+  // fresh session and replay the prompt manually. We surface this as
+  // a /-command so the help text explains the limitation.
+  slash.register('fork', '', '(unsupported on gemini — use `/new` then replay)', async (_args, ctx) => {
+    await ctx.reply(
+      'gemini-cli does not expose `session/fork` on ACP. ' +
+        'For a parallel branch, run `/new` (fresh session) then resend the prompt.',
+    )
   })
 
   // --- inbound TG → gemini -----------------------------------------------
@@ -578,6 +640,7 @@ async function main(): Promise<void> {
         sessionId = r.sessionId
         await sessionMap.set(m.chatId, sessionId)
         sessionToChat.set(sessionId, m.chatId)
+        loadedSessions.add(sessionId)
         log('info', `session/new chat=${m.chatId} sessionId=${sessionId.slice(0, 8)}`)
       } catch (err) {
         log('error', `session/new failed: ${(err as Error).message}`)
@@ -586,6 +649,39 @@ async function main(): Promise<void> {
       }
     } else {
       sessionToChat.set(sessionId, m.chatId)
+      // Stored sessionId from a prior bridge boot — the live gemini
+      // process doesn't know about it yet. Reattach via session/load
+      // so it can resume message history before we send the prompt.
+      // session/new auto-attaches; session/load is the only way to
+      // pick up a persisted session from disk on the wire.
+      if (!loadedSessions.has(sessionId)) {
+        try {
+          await gemini.sessionLoad(sessionId, DEFAULT_CWD)
+          loadedSessions.add(sessionId)
+          log('info', `session/load chat=${m.chatId} sessionId=${sessionId.slice(0, 8)} (restored)`)
+        } catch (err) {
+          // Persisted id no longer valid (gemini's project hash
+          // changed, or disk-side session was deleted). Drop the
+          // mapping and fall back to a fresh session.
+          log(
+            'warn',
+            `session/load failed for ${sessionId.slice(0, 8)} (${(err as Error).message}); falling back to session/new`,
+          )
+          await sessionMap.clear(m.chatId)
+          try {
+            const r = await gemini.sessionNew(DEFAULT_CWD)
+            sessionId = r.sessionId
+            await sessionMap.set(m.chatId, sessionId)
+            sessionToChat.set(sessionId, m.chatId)
+            loadedSessions.add(sessionId)
+            log('info', `session/new (load-fallback) chat=${m.chatId} sessionId=${sessionId.slice(0, 8)}`)
+          } catch (err2) {
+            log('error', `session/new fallback failed: ${(err2 as Error).message}`)
+            await tg.reply(m.chatId, `❌ gemini session/new failed: ${(err2 as Error).message}`)
+            return
+          }
+        }
+      }
     }
 
     // Post ⛔ Stop button so the user can interrupt long-running turns.
@@ -634,6 +730,8 @@ async function main(): Promise<void> {
         await sessionMap.set(m.chatId, newSessionId)
         sessionToChat.delete(sessionId)
         sessionToChat.set(newSessionId, m.chatId)
+        loadedSessions.delete(sessionId)
+        loadedSessions.add(newSessionId)
         // The auto-approve flag is session-scoped — when we transparently
         // open a fresh session, carry the user's intent forward so they
         // don't have to click the toggle again after every restart.
@@ -698,6 +796,17 @@ async function main(): Promise<void> {
   tg.on('ready', () => log('info', 'telegram polling ready'))
   const { username } = await tg.start()
   log('info', `telegram bot connected as @${username}`)
+
+  // Publish slash-command suggestions so Telegram's client shows a `/`
+  // autocomplete popup. Without this, typing the full command still
+  // works but the menu hint never appears.
+  try {
+    const cmds = slash.listForBotApi()
+    await tg.setMyCommands(cmds)
+    log('info', `setMyCommands published (${cmds.length}): ${cmds.map(c => c.command).join(', ')}`)
+  } catch (err) {
+    log('warn', `setMyCommands failed: ${(err as Error).message}`)
+  }
 
   const shutdown = async (sig: string) => {
     log('warn', `shutting down (signal=${sig})`)

@@ -570,6 +570,17 @@ async function main(): Promise<void> {
   const { username } = await tg.start()
   log('info', `telegram bot connected as @${username}`)
 
+  // Publish slash-command suggestions so Telegram's client shows a `/`
+  // autocomplete popup. Without this, typing the full command still
+  // works but the menu hint never appears.
+  try {
+    const cmds = slash.listForBotApi()
+    await tg.setMyCommands(cmds)
+    log('info', `setMyCommands published (${cmds.length}): ${cmds.map(c => c.command).join(', ')}`)
+  } catch (err) {
+    log('warn', `setMyCommands failed: ${(err as Error).message}`)
+  }
+
   // --- shutdown ----------------------------------------------------------
   const shutdown = async (sig: string) => {
     log('warn', `shutting down (signal=${sig})`)

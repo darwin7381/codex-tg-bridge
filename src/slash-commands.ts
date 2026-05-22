@@ -35,6 +35,23 @@ export class SlashCommandRouter {
     this.commands.set(name.toLowerCase(), { handler, usage, description })
   }
 
+  /**
+   * Snapshot of registered commands in a shape compatible with Telegram's
+   * Bot API `setMyCommands`: `[{ command, description }, ...]`. Telegram
+   * requires command names match `^[a-z0-9_]{1,32}$` and descriptions
+   * length 1-256.
+   */
+  listForBotApi(): Array<{ command: string; description: string }> {
+    const out: Array<{ command: string; description: string }> = []
+    // `/help` is implicit in dispatch() but not in the map — surface it.
+    out.push({ command: 'help', description: 'show available slash commands' })
+    for (const [name, { description }] of [...this.commands.entries()].sort()) {
+      if (!/^[a-z0-9_]{1,32}$/.test(name)) continue
+      out.push({ command: name, description: description.slice(0, 256) })
+    }
+    return out
+  }
+
   /** Returns `true` if `text` looked like a slash command and was dispatched
    *  (regardless of whether the command itself succeeded). */
   async dispatch(text: string, ctx: SlashContext): Promise<boolean> {
