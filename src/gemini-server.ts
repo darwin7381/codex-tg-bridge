@@ -603,6 +603,24 @@ async function main(): Promise<void> {
     }
   })
 
+  // User tapped a /list button → callback emits `resume:<session-id>`
+  // forwarded by telegram-client.ts as the 'resume' event. We route into
+  // resumeByRef() — same code path as the text command /resume <id>.
+  tg.on('resume', async (ev: { targetId: string; chatId: string; messageId?: number }) => {
+    log('info', `tg button → resume target=${ev.targetId.slice(0, 8)}… chat=${ev.chatId}`)
+    const ctx = {
+      chatId: ev.chatId,
+      reply: async (text: string) => { await tg.reply(ev.chatId, text) },
+      log,
+    }
+    try {
+      await resumeByRef(ev.targetId, ctx)
+    } catch (err) {
+      log('warn', `button resume failed: ${(err as Error).message}`)
+      await tg.reply(ev.chatId, `❌ resume failed: ${(err as Error).message}`).catch(() => {})
+    }
+  })
+
   // --- slash command router ----------------------------------------------
   // Bridge-managed commands run BEFORE the message is forwarded to gemini
   // as a prompt. Gemini's own `/memory`, `/extensions`, `/init`, `/restore`
@@ -637,25 +655,38 @@ async function main(): Promise<void> {
       '',
     ].filter(Boolean)
     const ids: string[] = []
+    // Buttons for the inline-keyboard companion to the text list. callback
+    // data = `resume:<full-sessionId>`. Gemini sessionId is 36-char UUID →
+    // "resume:" + 36 = 43 bytes, under TG's 64-byte cap.
+    const btnRows: Array<Array<{ text: string; data: string }>> = []
     entries.forEach((s, i) => {
       ids.push(s.sessionId)
       const tag = s.sessionId === cur ? '  ← current' : ''
-      // Use lastUpdated if present (more accurate), else file mtime.
       const tsRaw = s.lastUpdated ?? new Date(s.mtimeMs).toISOString()
-      // Format as "MM-DD HH:MM" (drop seconds, keep date for old sessions)
       const ts = tsRaw.slice(5, 16).replace('T', ' ')
       const msgs = s.msgCount != null ? `${s.msgCount}m` : '?'
       const title = (s.title ?? '(no user msg)').slice(0, 80)
-      // Two-line format: header + full session id (selectable code span).
       lines.push(`${i + 1}. ${ts}  ${msgs.padStart(5)}  ${title}${tag}`)
       lines.push(`   \`${s.sessionId}\``)
+      const mark = s.sessionId === cur ? '📍' : '↩️'
+      btnRows.push([{
+        text: `${mark} #${i + 1} ${ts} ${title.slice(0, 30)}`,
+        data: `resume:${s.sessionId}`,
+      }])
     })
     lastListByChat.set(ctx.chatId, ids)
     lines.push(
       '',
-      'use `/resume <number>` (e.g. `/resume 2`), `/resume <full-sessionId>`, or `/resume_last`.',
+      '👇 Tap a button to switch to that session (UUID passed directly).',
+      'Or use `/resume <number>`, `/resume <full-sessionId>`, `/resume_last`.',
     )
-    await ctx.reply(lines.join('\n'))
+    // Telegram inline_keyboard caps at 100 rows total — 30 max from our
+    // entries-slice is well under.
+    if (btnRows.length > 0) {
+      await tg.sendWithButtons(ctx.chatId, lines.join('\n'), btnRows)
+    } else {
+      await ctx.reply(lines.join('\n'))
+    }
   }
 
   slash.register('list', '', 'list recent gemini sessions (numbered; use /resume <number> to switch)', listSessionsHandler)

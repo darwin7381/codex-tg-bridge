@@ -1,6 +1,6 @@
 {
   "name": "codex-tg-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Zero-degradation Telegram bridge to OpenAI Codex via app-server JSON-RPC over WebSocket. Bridge forwards raw user text to Codex without injecting prompts or overriding config; streams item/* notifications back to TG unchanged.",
   "type": "module",
   "main": "src/server.ts",

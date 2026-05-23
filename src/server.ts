@@ -469,6 +469,25 @@ async function main(): Promise<void> {
     }
   })
 
+  // User tapped a /list button → callback emits `resume:<thread-id>`
+  // which telegram-client.ts forwards as the 'resume' event. We route
+  // straight into the same resumeByRef() the text command /resume <id>
+  // calls — no numeric-index resolution, no list shift races.
+  tg.on('resume', async (ev: { targetId: string; chatId: string; messageId?: number }) => {
+    log('info', `tg button → resume target=${ev.targetId.slice(0, 8)}… chat=${ev.chatId}`)
+    const ctx = {
+      chatId: ev.chatId,
+      reply: async (text: string) => { await tg.reply(ev.chatId, text) },
+      log,
+    }
+    try {
+      await resumeByRef(ev.targetId, ctx)
+    } catch (err) {
+      log('warn', `button resume failed: ${(err as Error).message}`)
+      await tg.reply(ev.chatId, `❌ resume failed: ${(err as Error).message}`).catch(() => {})
+    }
+  })
+
   // --- slash command router ----------------------------------------------
   // Bridge-managed commands run before the message is forwarded to codex
   // as a prompt. Codex doesn't expose set_mode / set_model RPCs the way
@@ -489,6 +508,7 @@ async function main(): Promise<void> {
   async function listThreadsHandler(_args: string, ctx: any): Promise<void> {
     const cur = sessionMap.get(ctx.chatId)
     const lines = [`current thread: \`${cur ?? '(none)'}\``, '']
+    let buttons: Array<Array<{ text: string; data: string }>> | null = null
     try {
       const result = (await codex.threadList({ limit: 15 })) as any
       const threads: any[] = result?.threads ?? result?.items ?? result?.data ?? []
@@ -497,6 +517,7 @@ async function main(): Promise<void> {
       } else {
         lines.push(`codex threads (${threads.length}):`)
         const ids: string[] = []
+        const btnRows: Array<Array<{ text: string; data: string }>> = []
         threads.slice(0, 15).forEach((t, i) => {
           const id = String(t.id ?? t.threadId ?? '?')
           ids.push(id)
@@ -504,15 +525,32 @@ async function main(): Promise<void> {
           const updated =
             t.updatedAt ?? t.updated_at ?? t.lastActivityAt ?? t.last_activity_at ?? '?'
           const title = t.title ?? t.name ?? t.preview ?? '(untitled)'
+          const updatedShort = String(updated).slice(5, 16).replace('T', ' ')
           lines.push(`${i + 1}. \`${id.slice(0, 8)}…\` ${String(updated).slice(0, 16)}  ${title}${tag}`)
+          const mark = id === cur ? '📍' : '↩️'
+          // callback data: `resume:<full-thread-id>`. Codex IDs are 36-char
+          // UUIDs, so "resume:" + 36 = 43 bytes — under TG's 64-byte cap.
+          btnRows.push([{
+            text: `${mark} #${i + 1} ${updatedShort} ${String(title).slice(0, 30)}`,
+            data: `resume:${id}`,
+          }])
         })
         lastListByChat.set(ctx.chatId, ids)
-        lines.push('', 'use `/resume <number>` (e.g. `/resume 2`), `/resume <full-id>`, or `/resume_last`.')
+        lines.push(
+          '',
+          '👇 Tap a button to resume that thread (no off-by-one — UUID passed directly).',
+          'Or use `/resume <number>`, `/resume <full-id>`, `/resume_last`.',
+        )
+        buttons = btnRows
       }
     } catch (err) {
       lines.push(`(thread/list failed: ${(err as Error).message})`)
     }
-    await ctx.reply(lines.join('\n'))
+    if (buttons && buttons.length > 0) {
+      await tg.sendWithButtons(ctx.chatId, lines.join('\n'), buttons)
+    } else {
+      await ctx.reply(lines.join('\n'))
+    }
   }
 
   slash.register('list', '', 'list recent codex threads (numbered; use /resume <number> to switch)', listThreadsHandler)

@@ -147,6 +147,21 @@ export class TelegramClient extends EventEmitter {
         await ctx.answerCallbackQuery({ text: '⛔ cancelling…' }).catch(() => {})
         return
       }
+      if (data.startsWith('resume:')) {
+        // `/list` button: payload is `resume:<full-thread-or-session-id>`.
+        // Subscribed by codex-server.ts and gemini-server.ts which call
+        // resumeByRef(id, ctx) — same path as the text command /resume <id>.
+        // Passing UUID directly bypasses numeric-index resolution, so there's
+        // no off-by-one risk if the list shifts between display and tap.
+        const targetId = data.slice('resume:'.length)
+        this.emit('resume', {
+          targetId,
+          chatId: String(ctx.chat?.id ?? ''),
+          messageId: ctx.callbackQuery.message?.message_id,
+        })
+        await ctx.answerCallbackQuery({ text: '↩️ switching…' }).catch(() => {})
+        return
+      }
       await ctx.answerCallbackQuery().catch(() => {})
     })
 
