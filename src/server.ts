@@ -553,10 +553,12 @@ async function main(): Promise<void> {
     }
   }
 
-  slash.register('list', '', 'list recent codex threads (numbered; use /resume <number> to switch)', listThreadsHandler)
-  // /sessions is a more-explicit alias people reach for ("show my sessions")
-  // and avoids confusion with generic "list" if other bridges are added.
-  slash.register('sessions', '', 'alias of /list — show recent codex threads', listThreadsHandler)
+  // /resume_list is the canonical name — unified with channel-bot (claude TUI)
+  // so the same slash command works across every bot Joey uses.
+  // /list and /sessions kept as aliases for backwards compat.
+  slash.register('resume_list', '', 'list recent codex threads with tap-to-resume buttons (canonical)', listThreadsHandler)
+  slash.register('list', '', 'alias of /resume_list — list recent codex threads', listThreadsHandler)
+  slash.register('sessions', '', 'alias of /resume_list — list recent codex threads', listThreadsHandler)
 
   async function resumeByRef(ref: string, ctx: any): Promise<void> {
     let targetId = ref
