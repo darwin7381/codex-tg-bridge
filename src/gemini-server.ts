@@ -689,10 +689,12 @@ async function main(): Promise<void> {
     }
   }
 
-  slash.register('list', '', 'list recent gemini sessions (numbered; use /resume <number> to switch)', listSessionsHandler)
-  // /sessions is a more-explicit alias people reach for, and avoids
-  // confusion with generic "list" if other tools also register one.
-  slash.register('sessions', '', 'alias of /list — show recent gemini sessions', listSessionsHandler)
+  // /resume_list is the canonical name — unified with channel-bot (claude TUI)
+  // and codex-tg-bridge so the same command works across every bot Joey uses.
+  // /list and /sessions kept as aliases for backwards compat.
+  slash.register('resume_list', '', 'list recent gemini sessions with tap-to-resume buttons (canonical)', listSessionsHandler)
+  slash.register('list', '', 'alias of /resume_list — list recent gemini sessions', listSessionsHandler)
+  slash.register('sessions', '', 'alias of /resume_list — list recent gemini sessions', listSessionsHandler)
 
   async function resumeByRef(ref: string, ctx: any): Promise<void> {
     let targetId = ref
