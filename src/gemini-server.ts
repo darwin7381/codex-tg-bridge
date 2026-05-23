@@ -41,7 +41,14 @@ function loadStateDirEnv(stateDir: string): void {
  * Scan gemini-cli's persisted chats for the current project. ACP's
  * `session/list` does not exist on gemini's wire (confirmed
  * 2026-05-16 — returns -32601 Method not found). Sessions are
- * persisted on disk at `~/.gemini/tmp/<basename(cwd)>/chats/session-*.json`.
+ * persisted on disk at `~/.gemini/tmp/<basename(cwd)>/chats/session-*`.
+ *
+ * Format note (2026-05-23): gemini ~v0.34 switched from `.json` (one
+ * big JSON document with a `messages[]` field) to `.jsonl` (NDJSON —
+ * one JSON line per event, first line is metadata, subsequent lines are
+ * messages + `$set` mutation ops). We handle BOTH formats: filename
+ * suffix decides the parser path. Sessions in `.jsonl` only were
+ * silently invisible until this fix (Joey 2026-05-23).
  *
  * Each file's `sessionId` field is the canonical id that
  * `session/load` accepts to restore message history.
@@ -52,9 +59,10 @@ type DiskSession = {
   mtimeMs: number
   lastUpdated?: string
   title?: string
+  msgCount?: number
 }
 
-function listGeminiSessionsFromDisk(cwd?: string, limit = 20): DiskSession[] {
+function listGeminiSessionsFromDisk(cwd?: string, limit = 30): DiskSession[] {
   const projectDir = basename(cwd ?? process.cwd())
   const chatsDir = join(
     process.env.HOME ?? '',
@@ -66,7 +74,10 @@ function listGeminiSessionsFromDisk(cwd?: string, limit = 20): DiskSession[] {
   if (!existsSync(chatsDir)) return []
   const entries: DiskSession[] = []
   for (const name of readdirSync(chatsDir)) {
-    if (!name.startsWith('session-') || !name.endsWith('.json')) continue
+    if (!name.startsWith('session-')) continue
+    const isJsonl = name.endsWith('.jsonl')
+    const isJson = name.endsWith('.json')
+    if (!isJsonl && !isJson) continue
     const full = join(chatsDir, name)
     let mtimeMs = 0
     try {
@@ -75,13 +86,53 @@ function listGeminiSessionsFromDisk(cwd?: string, limit = 20): DiskSession[] {
       continue
     }
     try {
-      const j = JSON.parse(readFileSync(full, 'utf8')) as {
+      const raw = readFileSync(full, 'utf8')
+
+      if (isJsonl) {
+        // NDJSON: line 1 = session metadata; line 2+ = messages / $set ops.
+        // Reading large transcripts (we've seen 80MB) is wasteful — cap.
+        // The first ~32 KiB is plenty for metadata + first user message.
+        const chunk = raw.slice(0, 32 * 1024)
+        let sessionId: string | undefined
+        let lastUpdated: string | undefined
+        let title: string | undefined
+        let msgCount = 0
+        for (const line of chunk.split('\n')) {
+          if (!line.startsWith('{')) continue
+          let j
+          try { j = JSON.parse(line) } catch { continue }
+          if (typeof j.sessionId === 'string' && !sessionId) sessionId = j.sessionId
+          if (typeof j.lastUpdated === 'string') lastUpdated = j.lastUpdated
+          if (j.$set?.lastUpdated && typeof j.$set.lastUpdated === 'string') {
+            lastUpdated = j.$set.lastUpdated
+          }
+          // user / gemini messages have type='user'|'gemini' and content
+          if (j.type === 'user' || j.type === 'gemini' || j.type === 'assistant') {
+            msgCount++
+            if (!title && j.type === 'user') {
+              const c = j.content
+              const text =
+                Array.isArray(c) && c[0] && typeof (c[0] as any).text === 'string'
+                  ? (c[0] as any).text
+                  : typeof c === 'string'
+                    ? c
+                    : ''
+              if (text) title = String(text).replace(/\s+/g, ' ').trim().slice(0, 100)
+            }
+          }
+        }
+        if (!sessionId) continue
+        entries.push({ sessionId, file: name, mtimeMs, lastUpdated, title, msgCount })
+        continue
+      }
+
+      // legacy .json — one JSON document with messages[]
+      const j = JSON.parse(raw) as {
         sessionId?: string
         lastUpdated?: string
         messages?: Array<{ type?: string; content?: unknown }>
       }
       if (!j.sessionId) continue
-      // first user message → title preview
       let title: string | undefined
       for (const m of j.messages ?? []) {
         if (m.type !== 'user') continue
@@ -93,7 +144,7 @@ function listGeminiSessionsFromDisk(cwd?: string, limit = 20): DiskSession[] {
               ? c
               : ''
         if (text) {
-          title = String(text).replace(/\s+/g, ' ').trim().slice(0, 60)
+          title = String(text).replace(/\s+/g, ' ').trim().slice(0, 100)
           break
         }
       }
@@ -103,6 +154,7 @@ function listGeminiSessionsFromDisk(cwd?: string, limit = 20): DiskSession[] {
         mtimeMs,
         lastUpdated: j.lastUpdated,
         title,
+        msgCount: j.messages?.length ?? 0,
       })
     } catch {
       // Skip malformed files (e.g. dump.txt, extract.js scratch files
@@ -569,23 +621,40 @@ async function main(): Promise<void> {
 
   async function listSessionsHandler(_args: string, ctx: any): Promise<void> {
     const cur = sessionMap.get(ctx.chatId)
-    const lines = [`current session: \`${cur ?? '(none)'}\``, '']
-    const entries = listGeminiSessionsFromDisk(DEFAULT_CWD, 15)
+    const entries = listGeminiSessionsFromDisk(DEFAULT_CWD, 30)
     if (entries.length === 0) {
-      lines.push('(no persisted gemini sessions found for this project)')
-    } else {
-      lines.push(`gemini sessions (${entries.length} shown, newest first):`)
-      const ids: string[] = []
-      entries.forEach((s, i) => {
-        ids.push(s.sessionId)
-        const tag = s.sessionId === cur ? ' ← current' : ''
-        const updated = (s.lastUpdated ?? new Date(s.mtimeMs).toISOString()).slice(0, 16)
-        const title = s.title ?? '(no user msg)'
-        lines.push(`${i + 1}. \`${s.sessionId.slice(0, 8)}…\` ${updated}  ${title}${tag}`)
-      })
-      lastListByChat.set(ctx.chatId, ids)
-      lines.push('', 'use `/resume <number>` (e.g. `/resume 2`), `/resume <full-sessionId>`, or `/resume_last`.')
+      await ctx.reply(`current: \`${cur ?? '(none)'}\`\n\n(no persisted gemini sessions found for this project)`)
+      return
     }
+    // Find current session entry for the header preview.
+    const curEntry = entries.find(e => e.sessionId === cur)
+    const curPreview = curEntry?.title?.slice(0, 80) ?? '(no preview)'
+    const lines = [
+      `📍 *current*  \`${cur ?? '(none)'}\``,
+      cur ? `   ${curPreview}` : '',
+      '',
+      `gemini sessions (${entries.length} shown, newest first):`,
+      '',
+    ].filter(Boolean)
+    const ids: string[] = []
+    entries.forEach((s, i) => {
+      ids.push(s.sessionId)
+      const tag = s.sessionId === cur ? '  ← current' : ''
+      // Use lastUpdated if present (more accurate), else file mtime.
+      const tsRaw = s.lastUpdated ?? new Date(s.mtimeMs).toISOString()
+      // Format as "MM-DD HH:MM" (drop seconds, keep date for old sessions)
+      const ts = tsRaw.slice(5, 16).replace('T', ' ')
+      const msgs = s.msgCount != null ? `${s.msgCount}m` : '?'
+      const title = (s.title ?? '(no user msg)').slice(0, 80)
+      // Two-line format: header + full session id (selectable code span).
+      lines.push(`${i + 1}. ${ts}  ${msgs.padStart(5)}  ${title}${tag}`)
+      lines.push(`   \`${s.sessionId}\``)
+    })
+    lastListByChat.set(ctx.chatId, ids)
+    lines.push(
+      '',
+      'use `/resume <number>` (e.g. `/resume 2`), `/resume <full-sessionId>`, or `/resume_last`.',
+    )
     await ctx.reply(lines.join('\n'))
   }
 
